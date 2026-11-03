@@ -220,6 +220,42 @@ class SkillPublishControllerTest {
             .andExpect(jsonPath("$.code").value(0));
     }
 
+
+    @Test
+    void publish_passesExplicitAssetIdAcrossBothPortalAliases() throws Exception {
+        SkillVersion version = new SkillVersion(12L,"2.0.0","usr_1");
+        version.setStatus(SkillVersionStatus.PENDING_REVIEW);
+        given(skillPublishService.publishFromEntries(eq("global"),anyList(),eq("usr_1"),
+            eq(SkillVisibility.PUBLIC),eq(Set.of("SUPER_ADMIN")),eq(true),eq(12L)))
+            .willReturn(new SkillPublishService.PublishResult(12L,"demo-skill",version));
+        var principal = new PlatformPrincipal("usr_1","publisher",null,null,"local",Set.of("SUPER_ADMIN"));
+        var auth = new UsernamePasswordAuthenticationToken(principal,null,List.of(new SimpleGrantedAuthority("ROLE_SUPER_ADMIN")));
+        for(String prefix:List.of("/api/v1/skills","/api/web/skills")) {
+            mockMvc.perform(multipart(prefix+"/global/publish")
+                .file(new MockMultipartFile("file","skill.zip","application/zip",buildZipBytes()))
+                .param("visibility","PUBLIC").param("confirmWarnings","true").param("skillId","12")
+                .with(authentication(auth)).with(csrf()))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.skillId").value(12));
+        }
+        verify(skillPublishService,org.mockito.Mockito.times(2)).publishFromEntries(eq("global"),anyList(),eq("usr_1"),
+            eq(SkillVisibility.PUBLIC),eq(Set.of("SUPER_ADMIN")),eq(true),eq(12L));
+        verify(skillPublishService,never()).publishFromEntries(eq("global"),anyList(),eq("usr_1"),
+            eq(SkillVisibility.PUBLIC),eq(Set.of("SUPER_ADMIN")),eq(true));
+    }
+
+    @Test
+    void publish_rejectsMalformedTargetWithoutFallingBackToCreate() throws Exception {
+        var principal = new PlatformPrincipal("usr_1","publisher",null,null,"local",Set.of("SUPER_ADMIN"));
+        var auth = new UsernamePasswordAuthenticationToken(principal,null,List.of(new SimpleGrantedAuthority("ROLE_SUPER_ADMIN")));
+        for(String target:List.of("other-asset","9223372036854775808")) {
+            mockMvc.perform(multipart("/api/v1/skills/global/publish")
+                .file(new MockMultipartFile("file","skill.zip","application/zip",buildZipBytes()))
+                .param("visibility","PUBLIC").param("skillId",target)
+                .with(authentication(auth)).with(csrf())).andExpect(status().isBadRequest());
+        }
+        org.mockito.Mockito.verifyNoInteractions(skillPublishService);
+    }
+
     private byte[] buildZipBytes() throws Exception {
         try (ByteArrayOutputStream output = new ByteArrayOutputStream();
              ZipOutputStream zip = new ZipOutputStream(output, StandardCharsets.UTF_8)) {

@@ -1,6 +1,11 @@
 package com.iflytek.skillhub.domain.skill.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import jakarta.persistence.LockModeType;
+import jakarta.persistence.EntityNotFoundException;
+import com.iflytek.skillhub.domain.review.ReviewSubjectType;
 import com.iflytek.skillhub.domain.event.ReviewSubmittedEvent;
 import com.iflytek.skillhub.domain.event.SkillPublishedEvent;
 import com.iflytek.skillhub.domain.namespace.Namespace;
@@ -63,9 +68,15 @@ import java.util.zip.ZipOutputStream;
  *
  * <p>The service validates archive contents, parses metadata, stores files,
  * creates review tasks when needed, and updates the skill's lifecycle pointer.
+ * EntityManager refresh is necessary to replace stale managed state after row-lock waits.
+ * Publication locks review history, namespace, versions, then asset, matching review/deletion.
+ * The namespace write lock also serializes creation before a skill coordinate exists.
  */
 @Service
 public class SkillPublishService {
+    private final SlarkAssetAuthorization slarkAssetAuthorization;
+    @PersistenceContext
+    private EntityManager entityManager;
 
     private static final DateTimeFormatter AUTO_VERSION_FORMATTER =
             DateTimeFormatter.ofPattern("yyyyMMdd.HHmmss").withZone(ZoneId.systemDefault());
@@ -124,7 +135,7 @@ public class SkillPublishService {
             SecurityScanService securityScanService,
             SkillStorageDeletionCompensationService compensationService,
             ApplicationEventPublisher eventPublisher,
-            Clock clock) {
+            Clock clock, SlarkAssetAuthorization slarkAssetAuthorization) {
         this.namespaceRepository = namespaceRepository;
         this.namespaceMemberRepository = namespaceMemberRepository;
         this.skillRepository = skillRepository;
@@ -140,6 +151,7 @@ public class SkillPublishService {
         this.compensationService = compensationService;
         this.eventPublisher = eventPublisher;
         this.clock = clock;
+        this.slarkAssetAuthorization = slarkAssetAuthorization;
     }
 
     public record DryRunResult(
@@ -178,6 +190,7 @@ public class SkillPublishService {
             return new DryRunResult(false, errors, warnings, null, null);
         }
         Namespace namespace = namespaceOpt.get();
+        slarkAssetAuthorization.assertVisibility(namespace.getId(), visibility);
         if (namespace.getStatus() == NamespaceStatus.FROZEN) {
             errors.add("Namespace is frozen: " + namespaceSlug);
         }
@@ -185,15 +198,19 @@ public class SkillPublishService {
             errors.add("Namespace is archived: " + namespaceSlug);
         }
 
-        // 2. Check membership
-        boolean isSuperAdmin = platformRoles.contains("SUPER_ADMIN");
-        if (!isSuperAdmin) {
+        // 2. Check current eligibility; local roles cannot substitute for a bound scope.
+        var eligibility = slarkAssetAuthorization.can(SlarkAssetAuthorization.Operation.CREATE,
+                namespace.getId(), null, publisherId);
+        boolean slarkNamespace = eligibility.isPresent();
+        if (eligibility.filter(allowed -> !allowed).isPresent()) errors.add("error.skill.lifecycle.noPermission");
+        boolean isSuperAdmin = platformRoles.contains("SUPER_ADMIN") && !slarkNamespace;
+        if (!slarkNamespace && !isSuperAdmin) {
             var member = namespaceMemberRepository.findByNamespaceIdAndUserId(namespace.getId(), publisherId);
             if (member.isEmpty()) {
                 errors.add("Publisher is not a member of namespace: " + namespaceSlug);
             }
         }
-        if (requiresSecurityScanner(visibility) && !securityScanService.isEnabled()) {
+        if ((slarkNamespace || requiresSecurityScanner(visibility)) && !securityScanService.isEnabled()) {
             errors.add("error.security.scanner.required");
         }
 
@@ -247,6 +264,10 @@ public class SkillPublishService {
         // 6. Slug conflict, archived skill, and version-exists checks
         if (resolvedSlug != null && errors.isEmpty()) {
             List<Skill> existingSkills = skillRepository.findByNamespaceIdAndSlug(namespace.getId(), resolvedSlug);
+            if (slarkNamespace && !existingSkills.isEmpty()) {
+                errors.add("error.skill.publish.target.required");
+                return new DryRunResult(false, errors, warnings, resolvedSlug, resolvedVersion);
+            }
             for (Skill existing : existingSkills) {
                 if (existing.getOwnerId().equals(publisherId)) {
                     if (existing.getStatus() == SkillStatus.ARCHIVED) {
@@ -303,6 +324,15 @@ public class SkillPublishService {
         return publishFromEntriesInternal(namespaceSlug, entries, publisherId, visibility, platformRoles, confirmWarnings, false, false);
     }
 
+    /** Upload into one explicitly selected Slark asset; the ID never grants maintenance rights. */
+    @Transactional
+    public PublishResult publishFromEntries(
+            String namespaceSlug, List<PackageEntry> entries, String publisherId,
+            SkillVisibility visibility, Set<String> platformRoles, boolean confirmWarnings, Long skillId) {
+        return publishFromEntriesInternal(namespaceSlug, entries, publisherId, visibility, platformRoles,
+                confirmWarnings, false, false, null, null, skillId);
+    }
+
     /**
      * Publishes one package that was explicitly bound by a confirmed Suite Bundle plan.
      *
@@ -349,8 +379,34 @@ public class SkillPublishService {
             boolean confirmWarnings) {
         Skill skill = skillRepository.findById(skillId)
                 .orElseThrow(() -> new DomainBadRequestException("error.skill.notFound", skillId));
-        assertCanManageLifecycle(skill, publisherId, userNamespaceRoles);
+        boolean slarkRerelease = assertCanManageLifecycle(skill, publisherId, userNamespaceRoles);
 
+        Long expectedNamespaceId = skill.getNamespaceId();
+        String expectedSlug = skill.getSlug();
+        Namespace namespace = namespaceRepository.findById(expectedNamespaceId)
+                .orElseThrow(() -> new DomainBadRequestException("error.namespace.notFound", expectedNamespaceId));
+        Skill selectedTarget = slarkRerelease ? skill : nativeRereleaseTarget(skill, publisherId);
+        List<Skill> candidates = new ArrayList<>(List.of(skill));
+        if (selectedTarget != null && !Objects.equals(selectedTarget.getId(), skill.getId())) candidates.add(selectedTarget);
+        // Read no object bytes until both source and existing target are locked. Taking only
+        // the source first would acquire target review locks after namespace/version locks.
+        lockPublications(namespace, candidates);
+        if (!Objects.equals(expectedNamespaceId, skill.getNamespaceId())
+                || !Objects.equals(expectedSlug, skill.getSlug())) {
+            throw new DomainBadRequestException("error.skill.publish.target.mismatch");
+        }
+        assertNamespaceWritable(namespace);
+        if (assertCanManageLifecycle(skill, publisherId, userNamespaceRoles) != slarkRerelease) {
+            throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+        }
+        if (skill.getStatus() == SkillStatus.ARCHIVED) {
+            throw new DomainBadRequestException("error.skill.publish.archived", skill.getSlug());
+        }
+        Skill currentTarget = slarkRerelease ? skill : nativeRereleaseTarget(skill, publisherId);
+        if (!Objects.equals(selectedTarget == null ? null : selectedTarget.getId(),
+                currentTarget == null ? null : currentTarget.getId())) {
+            throw new DomainBadRequestException("error.skill.publish.concurrentConflict", expectedSlug);
+        }
         SkillVersion publishedVersion = skillVersionRepository.findBySkillIdAndVersion(skillId, sourceVersion)
                 .orElseThrow(() -> new DomainBadRequestException("error.skill.version.notFound", sourceVersion));
         if (publishedVersion.getStatus() != SkillVersionStatus.PUBLISHED) {
@@ -360,7 +416,17 @@ public class SkillPublishService {
             throw new DomainBadRequestException("error.skill.version.exists", targetVersion);
         }
 
+        if (slarkRerelease) {
+            if (!securityScanService.isEnabled()) {
+                throw new DomainBadRequestException("error.security.scanner.required");
+            }
+        }
         List<PackageEntry> entries = rebuildEntriesForRerelease(skillId, publishedVersion.getId(), targetVersion);
+        PackageEntry skillMd = entries.stream().filter(entry -> entry.path().equals("SKILL.md")).findFirst()
+                .orElseThrow(() -> new DomainBadRequestException("error.skill.publish.skillMd.notFound"));
+        if (!Objects.equals(expectedSlug, SlugValidator.slugify(skillMetadataParser.parse(new String(skillMd.content())).name()))) {
+            throw new DomainBadRequestException("error.skill.publish.target.mismatch");
+        }
 
         // Rerelease follows the same visibility-based workflow as normal publish:
         // - PRIVATE skills go to UPLOADED status
@@ -373,8 +439,15 @@ public class SkillPublishService {
                 Set.of(),
                 confirmWarnings,  // confirmWarnings: honour caller's choice for rerelease
                 false,  // forceAutoPublish=false: respect visibility rules
-                true
+                true,
+                null,
+                slarkRerelease ? skill : null
         );
+    }
+
+    private Skill nativeRereleaseTarget(Skill source, String publisherId) {
+        if (Objects.equals(source.getOwnerId(), publisherId)) return source;
+        return skillRepository.findByNamespaceIdAndSlugAndOwnerId(source.getNamespaceId(), source.getSlug(), publisherId).orElse(null);
     }
 
     private PublishResult publishFromEntriesInternal(
@@ -401,16 +474,55 @@ public class SkillPublishService {
             boolean forceAutoPublish,
             boolean bypassMembershipCheck,
             BundlePublicationTarget bundleTarget) {
+        return publishFromEntriesInternal(namespaceSlug, entries, publisherId, visibility, platformRoles,
+                confirmWarnings, forceAutoPublish, bypassMembershipCheck, bundleTarget, null);
+    }
+
+    private PublishResult publishFromEntriesInternal(
+            String namespaceSlug,
+            List<PackageEntry> entries,
+            String publisherId,
+            SkillVisibility visibility,
+            Set<String> platformRoles,
+            boolean confirmWarnings,
+            boolean forceAutoPublish,
+            boolean bypassMembershipCheck,
+            BundlePublicationTarget bundleTarget,
+            Skill pinnedTarget) {
+        return publishFromEntriesInternal(namespaceSlug, entries, publisherId, visibility, platformRoles,
+                confirmWarnings, forceAutoPublish, bypassMembershipCheck, bundleTarget, pinnedTarget, null);
+    }
+
+    private PublishResult publishFromEntriesInternal(
+            String namespaceSlug, List<PackageEntry> entries, String publisherId,
+            SkillVisibility visibility, Set<String> platformRoles, boolean confirmWarnings,
+            boolean forceAutoPublish, boolean bypassMembershipCheck,
+            BundlePublicationTarget bundleTarget, Skill pinnedTarget, Long explicitSkillId) {
 
         // 1. Find namespace by slug
         Namespace namespace = namespaceRepository.findBySlug(namespaceSlug)
                 .orElseThrow(() -> new DomainBadRequestException("error.namespace.slug.notFound", namespaceSlug));
         assertNamespaceWritable(namespace);
 
-        boolean isSuperAdmin = platformRoles.contains("SUPER_ADMIN");
+        var eligibility = slarkAssetAuthorization.can(
+                SlarkAssetAuthorization.Operation.CREATE, namespace.getId(), null, publisherId);
+        boolean slarkNamespace = eligibility.isPresent();
+        if (eligibility.filter(allowed -> !allowed).isPresent()
+                || (pinnedTarget != null && !slarkNamespace)) {
+            throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+        }
+        slarkAssetAuthorization.assertVisibility(namespace.getId(), visibility);
+        if (explicitSkillId != null) {
+            if (!slarkNamespace) throw new DomainBadRequestException("error.skill.publish.target.unsupported");
+            if (explicitSkillId <= 0) throw new DomainBadRequestException("error.skill.publish.target.mismatch");
+            pinnedTarget = skillRepository.findById(explicitSkillId)
+                    .filter(target -> Objects.equals(target.getNamespaceId(), namespace.getId()))
+                    .orElseThrow(() -> new DomainBadRequestException("error.skill.publish.target.mismatch"));
+        }
+        boolean isSuperAdmin = platformRoles.contains("SUPER_ADMIN") && !slarkNamespace;
 
-        // 2. Check publisher is member unless SUPER_ADMIN short-circuits permission checks
-        if (!isSuperAdmin && !bypassMembershipCheck) {
+        // Native membership is not the authority for a Slark-bound scope.
+        if (!slarkNamespace && !isSuperAdmin && !bypassMembershipCheck) {
             namespaceMemberRepository.findByNamespaceIdAndUserId(namespace.getId(), publisherId)
                     .orElseThrow(() -> new DomainBadRequestException("error.skill.publish.publisher.notMember", namespaceSlug));
         }
@@ -436,6 +548,10 @@ public class SkillPublishService {
             metadata = new SkillMetadata(metadata.name(), metadata.description(), autoVersion, metadata.body(), metadata.frontmatter());
         }
         String skillSlug = SlugValidator.slugify(metadata.name());
+        if (pinnedTarget != null && (!Objects.equals(pinnedTarget.getNamespaceId(), namespace.getId())
+                || !Objects.equals(pinnedTarget.getSlug(), skillSlug))) {
+            throw new DomainBadRequestException("error.skill.publish.target.mismatch");
+        }
         if (bundleTarget != null
                 && (!bundleTarget.expectedSkillSlug().equals(skillSlug)
                 || !bundleTarget.expectedVersion().equals(metadata.version()))) {
@@ -462,18 +578,62 @@ public class SkillPublishService {
                     "error.skill.publish.precheck.confirmRequired",
                     formatValidationMessages(publishWarnings));
         }
-        if (requiresSecurityScanner(visibility) && !securityScanService.isEnabled()) {
+        if ((slarkNamespace || requiresSecurityScanner(visibility)) && !securityScanService.isEnabled()) {
             throw new DomainBadRequestException("error.security.scanner.required");
+        }
+
+        // Select before taking the namespace lock: never discover and lock review tasks
+        // after it (review decisions acquire those tasks before the namespace).
+        Skill selected = pinnedTarget;
+        if (selected == null && bundleTarget != null && bundleTarget.expectedSkillId() != null) {
+            selected = skillRepository.findByNamespaceIdAndSlug(namespace.getId(), skillSlug).stream()
+                    .filter(candidate -> Objects.equals(candidate.getId(), bundleTarget.expectedSkillId()))
+                    .findFirst().orElseThrow(this::bundleStateChanged);
+        } else if (selected == null && bundleTarget == null && !slarkNamespace) {
+            selected = skillRepository.findByNamespaceIdAndSlugAndOwnerId(namespace.getId(), skillSlug, publisherId).orElse(null);
+        }
+        if (selected != null && (!Objects.equals(selected.getNamespaceId(), namespace.getId())
+                || !Objects.equals(selected.getSlug(), skillSlug))) {
+            throw new DomainBadRequestException("error.skill.publish.target.mismatch");
+        }
+        List<ReviewTask> lockedHistory = lockPublication(namespace, selected);
+        if (!Objects.equals(namespace.getSlug(), namespaceSlug)) {
+            throw new DomainBadRequestException("error.skill.publish.target.mismatch");
+        }
+        assertNamespaceWritable(namespace);
+        var currentEligibility = slarkAssetAuthorization.can(
+                SlarkAssetAuthorization.Operation.CREATE, namespace.getId(), null, publisherId);
+        if (currentEligibility.isPresent() != slarkNamespace || currentEligibility.filter(allowed -> !allowed).isPresent()) {
+            throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+        }
+        slarkAssetAuthorization.assertVisibility(namespace.getId(), visibility);
+        if (!slarkNamespace && !isSuperAdmin && !bypassMembershipCheck) {
+            namespaceMemberRepository.findByNamespaceIdAndUserId(namespace.getId(), publisherId)
+                    .orElseThrow(() -> new DomainBadRequestException("error.skill.publish.publisher.notMember", namespaceSlug));
+        }
+        if (selected != null && (!Objects.equals(selected.getNamespaceId(), namespace.getId())
+                || !Objects.equals(selected.getSlug(), skillSlug))) {
+            throw new DomainBadRequestException("error.skill.publish.target.mismatch");
+        }
+        if (pinnedTarget == null && bundleTarget == null && !slarkNamespace) {
+            Skill current = skillRepository.findByNamespaceIdAndSlugAndOwnerId(namespace.getId(), skillSlug, publisherId).orElse(null);
+            if (!Objects.equals(selected == null ? null : selected.getId(), current == null ? null : current.getId())) {
+                throw new DomainBadRequestException("error.skill.publish.concurrentConflict", skillSlug);
+            }
         }
 
         // 6. Find or create Skill record (with owner isolation)
         List<Skill> existingSkills = skillRepository.findByNamespaceIdAndSlug(namespace.getId(), skillSlug);
+        if (slarkNamespace && pinnedTarget == null && bundleTarget == null && !existingSkills.isEmpty()) {
+            throw new DomainBadRequestException("error.skill.publish.target.required");
+        }
 
         // Check if any other owner's skill has published versions
         // Only PUBLISHED status blocks same-name publishing (UPLOADED/PENDING_REVIEW allowed)
         for (Skill existing : existingSkills) {
-            boolean isBoundTarget = bundleTarget != null
-                    && Objects.equals(existing.getId(), bundleTarget.expectedSkillId());
+            boolean isBoundTarget = (bundleTarget != null
+                    && Objects.equals(existing.getId(), bundleTarget.expectedSkillId()))
+                    || (pinnedTarget != null && Objects.equals(existing.getId(), pinnedTarget.getId()));
             if (!existing.getOwnerId().equals(publisherId) && !isBoundTarget) {
                 boolean hasPublished = !skillVersionRepository
                         .findBySkillIdAndStatus(existing.getId(), SkillVersionStatus.PUBLISHED)
@@ -489,10 +649,15 @@ public class SkillPublishService {
             }
         }
 
-        Skill skill = bundleTarget == null
-                ? findOrCreateOwnedSkill(namespace, skillSlug, publisherId, visibility)
+        Skill skill = pinnedTarget != null ? pinnedTarget : (bundleTarget == null
+                ? (slarkNamespace ? createSkill(namespace, skillSlug, publisherId, visibility)
+                    : findOrCreateOwnedSkill(namespace, skillSlug, publisherId, visibility))
                 : resolveBundleTargetSkill(namespace, existingSkills, publisherId, visibility,
-                        platformRoles, bundleTarget);
+                        platformRoles, bundleTarget));
+        if (slarkNamespace && !slarkAssetAuthorization.can(SlarkAssetAuthorization.Operation.SUBMIT,
+                namespace.getId(), skill.getId(), publisherId).orElse(false)) {
+            throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+        }
 
         if (skill.getStatus() == SkillStatus.ARCHIVED) {
             throw new DomainBadRequestException("error.skill.publish.archived", skillSlug);
@@ -507,8 +672,7 @@ public class SkillPublishService {
         }
         if (bundleTarget == null) {
             for (SkillVersion pending : pendingVersions) {
-                reviewTaskRepository.findBySkillVersionIdAndStatus(pending.getId(), ReviewTaskStatus.PENDING)
-                        .ifPresent(reviewTaskRepository::delete);
+                deleteLockedPendingTasks(lockedHistory, pending);
                 pending.setStatus(SkillVersionStatus.UPLOADED);
                 skillVersionRepository.save(pending);
             }
@@ -524,13 +688,13 @@ public class SkillPublishService {
             if (matchedVersion.getStatus() == SkillVersionStatus.PUBLISHED) {
                 throw new DomainBadRequestException("error.skill.version.exists", metadata.version());
             }
-            deleteReplaceableVersionArtifacts(skill, matchedVersion, namespaceSlug);
+            deleteReplaceableVersionArtifacts(skill, matchedVersion, namespaceSlug, lockedHistory);
         }
 
         // 8. Create SkillVersion
         SkillVersion version = new SkillVersion(skill.getId(), metadata.version(), publisherId);
         version.setRequestedVisibility(visibility);
-        boolean autoPublish = forceAutoPublish || isSuperAdmin;
+        boolean autoPublish = !slarkNamespace && (forceAutoPublish || isSuperAdmin);
         if (autoPublish) {
             version.setStatus(SkillVersionStatus.PUBLISHED);
             version.setPublishedAt(currentTime());
@@ -678,6 +842,10 @@ public class SkillPublishService {
         }
         skill.setUpdatedBy(publisherId);
         skillRepository.save(skill);
+        // A Bundle may confirm the new private version in this same transaction.
+        // Persist our own changes while publication locks are held, before that
+        // service refreshes managed entities to observe concurrent decisions.
+        skillRepository.flush();
 
         if (autoPublish) {
             eventPublisher.publishEvent(new SkillPublishedEvent(skill.getId(), version.getId(), publisherId));
@@ -685,6 +853,69 @@ public class SkillPublishService {
 
         // 13. Return identifiers for the created version
         return new PublishResult(skill.getId(), skill.getSlug(), version);
+    }
+
+    private List<ReviewTask> lockPublication(Namespace namespace, Skill skill) {
+        return lockPublications(namespace, skill == null ? List.of() : List.of(skill));
+    }
+
+    private List<ReviewTask> lockPublications(Namespace namespace, List<Skill> candidates) {
+        List<Skill> assets = candidates.stream().sorted(Comparator.comparing(Skill::getId)).toList();
+        List<ReviewTask> history = assets.stream()
+                .flatMap(asset -> reviewTaskRepository.findBySkillIdOrderByIdAsc(asset.getId()).stream())
+                .sorted(Comparator.comparing(ReviewTask::getId)).toList();
+        for (ReviewTask task : history) refreshForPublication(task);
+        refreshForPublication(namespace);
+        List<SkillVersion> versions = assets.stream().flatMap(asset -> skillVersionRepository.findBySkillId(asset.getId()).stream())
+                .sorted(Comparator.comparing(SkillVersion::getId)).toList();
+        for (SkillVersion version : versions) refreshForPublication(version);
+        for (Skill asset : assets) refreshForPublication(asset);
+        List<Long> current = assets.stream().flatMap(asset -> reviewTaskRepository.findBySkillIdOrderByIdAsc(asset.getId()).stream())
+                .map(ReviewTask::getId).sorted().toList();
+        if (!history.stream().map(ReviewTask::getId).toList().equals(current)) {
+            throw new DomainBadRequestException("error.skill.publish.concurrentConflict");
+        }
+        for (ReviewTask task : history) {
+            if (task.getSubjectType() != ReviewSubjectType.SKILL_VERSION
+                    || !Objects.equals(task.getNamespaceId(), namespace.getId())
+                    || !Objects.equals(task.getSubjectId(), task.getSkillId())
+                    || !Objects.equals(task.getSubjectVersionId(), task.getSkillVersionId())
+                    || !Objects.equals(task.getSubjectVersion(), task.getSkillVersion())) {
+                throw new DomainBadRequestException("review.candidate.mismatch");
+            }
+            if (task.getSkillVersionId() != null) {
+                SkillVersion reviewed = versions.stream()
+                        .filter(version -> Objects.equals(version.getId(), task.getSkillVersionId()))
+                        .findFirst().orElseThrow(() -> new DomainBadRequestException("review.candidate.mismatch"));
+                if (!Objects.equals(reviewed.getSkillId(), task.getSkillId())
+                        || !Objects.equals(task.getSkillVersion(), reviewed.getVersion())) {
+                    throw new DomainBadRequestException("review.candidate.mismatch");
+                }
+            } else if (task.getStatus() == ReviewTaskStatus.PENDING) {
+                throw new DomainBadRequestException("review.candidate.mismatch");
+            }
+        }
+        return history;
+    }
+
+    private void refreshForPublication(Object entity) {
+        try {
+            entityManager.refresh(entity, LockModeType.PESSIMISTIC_WRITE);
+        } catch (EntityNotFoundException ex) {
+            throw new DomainBadRequestException("error.skill.publish.concurrentConflict");
+        }
+    }
+
+    private void deleteLockedPendingTasks(List<ReviewTask> history, SkillVersion version) {
+        for (ReviewTask task : history) {
+            if (Objects.equals(task.getSkillVersionId(), version.getId()) && task.getStatus() == ReviewTaskStatus.PENDING) {
+                if (!Objects.equals(task.getSkillVersion(), version.getVersion())) {
+                    throw new DomainBadRequestException("review.candidate.mismatch");
+                }
+                // A pending version may also be the replacement target; do not delete twice.
+                if (entityManager.contains(task)) reviewTaskRepository.delete(task);
+            }
+        }
     }
 
     private Skill findOrCreateOwnedSkill(
@@ -736,6 +967,7 @@ public class SkillPublishService {
             Skill savedSkill = skillRepository.save(newSkill);
             // save() may defer the unique-constraint check until transaction commit.
             skillRepository.flush();
+            slarkAssetAuthorization.initializeCreator(savedSkill, publisherId);
             return savedSkill;
         } catch (DataIntegrityViolationException ex) {
             throw new DomainBadRequestException("error.skill.publish.concurrentConflict", skillSlug);
@@ -746,7 +978,7 @@ public class SkillPublishService {
         return new DomainBadRequestException("error.suite.bundle.member.stateChanged");
     }
 
-    private void deleteReplaceableVersionArtifacts(Skill skill, SkillVersion version, String namespaceSlug) {
+    private void deleteReplaceableVersionArtifacts(Skill skill, SkillVersion version, String namespaceSlug, List<ReviewTask> lockedHistory) {
         if (!REPLACEABLE_VERSION_STATUSES.contains(version.getStatus())) {
             throw new DomainBadRequestException("error.skill.version.exists", version.getVersion());
         }
@@ -761,8 +993,7 @@ public class SkillPublishService {
         // A replaceable version may still have one obsolete pending task, but settled attempts are
         // durable governance history. The database detaches those settled attempts from the
         // replaced version while retaining their skill/version snapshot.
-        reviewTaskRepository.findBySkillVersionIdAndStatus(version.getId(), ReviewTaskStatus.PENDING)
-                .ifPresent(reviewTaskRepository::delete);
+        deleteLockedPendingTasks(lockedHistory, version);
 
         List<SkillFile> files = skillFileRepository.findByVersionId(version.getId());
         List<String> storageKeys = new ArrayList<>();
@@ -839,16 +1070,22 @@ public class SkillPublishService {
         }
     }
 
-    private void assertCanManageLifecycle(Skill skill,
+    private boolean assertCanManageLifecycle(Skill skill,
                                           String actorUserId,
                                           Map<Long, NamespaceRole> userNamespaceRoles) {
-        assertCanManageLifecycle(skill, actorUserId, userNamespaceRoles, Set.of());
+        return assertCanManageLifecycle(skill, actorUserId, userNamespaceRoles, Set.of());
     }
 
-    private void assertCanManageLifecycle(Skill skill,
+    private boolean assertCanManageLifecycle(Skill skill,
                                           String actorUserId,
                                           Map<Long, NamespaceRole> userNamespaceRoles,
                                           Set<String> platformRoles) {
+        var decision = slarkAssetAuthorization.can(SlarkAssetAuthorization.Operation.SUBMIT,
+                skill.getNamespaceId(), skill.getId(), actorUserId);
+        if (decision.isPresent()) {
+            if (!decision.get()) throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+            return true;
+        }
         NamespaceRole namespaceRole = userNamespaceRoles.get(skill.getNamespaceId());
         boolean canManage = skill.getOwnerId().equals(actorUserId)
                 || namespaceRole == NamespaceRole.ADMIN
@@ -857,6 +1094,7 @@ public class SkillPublishService {
         if (!canManage) {
             throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
         }
+        return false;
     }
 
     private record BundlePublicationTarget(

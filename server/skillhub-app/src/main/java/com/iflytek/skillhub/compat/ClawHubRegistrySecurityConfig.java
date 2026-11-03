@@ -1,6 +1,9 @@
 package com.iflytek.skillhub.compat;
 
 import com.iflytek.skillhub.auth.token.ApiTokenAuthenticationFilter;
+import com.iflytek.skillhub.auth.slark.SlarkBridgeGuardFilter;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.security.web.authentication.logout.LogoutFilter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
@@ -21,7 +24,7 @@ public class ClawHubRegistrySecurityConfig {
 
     @Bean
     @Order(0)
-    public SecurityFilterChain publicLabelFilterChain(HttpSecurity http) throws Exception {
+    public SecurityFilterChain publicLabelFilterChain(HttpSecurity http, ObjectProvider<SlarkBridgeGuardFilter> slarkGuard) throws Exception {
         http
                 .securityMatcher(
                         new OrRequestMatcher(
@@ -34,6 +37,7 @@ public class ClawHubRegistrySecurityConfig {
                 .securityContext(context -> context.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
 
+        slarkGuard.ifAvailable(filter -> http.addFilterBefore(filter, LogoutFilter.class));
         return http.build();
     }
 
@@ -41,7 +45,8 @@ public class ClawHubRegistrySecurityConfig {
     @Order(1)
     public SecurityFilterChain clawHubRegistryFilterChain(
             HttpSecurity http,
-            ApiTokenAuthenticationFilter apiTokenAuthenticationFilter) throws Exception {
+            ApiTokenAuthenticationFilter apiTokenAuthenticationFilter,
+            ObjectProvider<SlarkBridgeGuardFilter> slarkGuard) throws Exception {
         http
                 .securityMatcher(
                         "/api/v1/search",
@@ -53,6 +58,7 @@ public class ClawHubRegistrySecurityConfig {
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .addFilterBefore(apiTokenAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
 
+        slarkGuard.ifAvailable(filter -> http.addFilterBefore(filter, LogoutFilter.class));
         return http.build();
     }
 }

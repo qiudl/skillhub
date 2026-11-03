@@ -16,12 +16,15 @@ import com.iflytek.skillhub.domain.shared.exception.DomainForbiddenException;
 import com.iflytek.skillhub.domain.shared.exception.DomainNotFoundException;
 import com.iflytek.skillhub.domain.skill.Skill;
 import com.iflytek.skillhub.domain.skill.SkillRepository;
+import com.iflytek.skillhub.domain.skill.SkillStatus;
 import com.iflytek.skillhub.domain.skill.SkillVersion;
 import com.iflytek.skillhub.domain.skill.SkillVersionRepository;
 import com.iflytek.skillhub.domain.skill.SkillVersionStatus;
 import com.iflytek.skillhub.domain.skill.metadata.SkillMetadata;
 import com.iflytek.skillhub.domain.skill.service.SkillGovernanceService;
+import com.iflytek.skillhub.domain.skill.service.SkillSubmissionGuard;
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
@@ -32,6 +35,7 @@ import java.time.Instant;
 import java.util.ConcurrentModificationException;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -55,6 +59,7 @@ public class ReviewService {
     private final GovernanceNotificationService governanceNotificationService;
     private final EntityManager entityManager;
     private final Clock clock;
+    private final SkillSubmissionGuard submissionGuard;
 
     public ReviewService(ReviewTaskRepository reviewTaskRepository,
                          SkillVersionRepository skillVersionRepository,
@@ -78,6 +83,7 @@ public class ReviewService {
         this.governanceNotificationService = governanceNotificationService;
         this.entityManager = entityManager;
         this.clock = clock;
+        this.submissionGuard = new SkillSubmissionGuard(namespaceRepository, reviewTaskRepository, entityManager);
     }
 
     /**
@@ -94,9 +100,7 @@ public class ReviewService {
 
         Skill skill = skillRepository.findById(skillVersion.getSkillId())
                 .orElseThrow(() -> new DomainNotFoundException("skill.not_found", skillVersion.getSkillId()));
-        Namespace namespace = namespaceRepository.findById(skill.getNamespaceId())
-                .orElseThrow(() -> new DomainNotFoundException("namespace.not_found", skill.getNamespaceId()));
-        assertNamespaceActive(namespace);
+        submissionGuard.lock(skill, skillVersion);
 
         if (!permissionChecker.canSubmitForReview(skill, userId, userNamespaceRoles, platformRoles)) {
             throw new DomainForbiddenException("review.submit.no_permission");
@@ -108,6 +112,7 @@ public class ReviewService {
             throw new DomainBadRequestException("review.submit.not_draft", skillVersionId);
         }
 
+        permissionChecker.assertCandidateVisibility(skill, skillVersion);
         skillVersion.setStatus(SkillVersionStatus.PENDING_REVIEW);
         skillVersionRepository.save(skillVersion);
 
@@ -125,8 +130,8 @@ public class ReviewService {
     }
 
     /**
-     * Legacy overload that evaluates submission rights only from namespace
-     * memberships.
+     * Legacy overload that retains native membership semantics and applies
+     * asset-specific live authority to Slark-bound namespaces.
      */
     @Transactional
     public ReviewTask submitReview(Long skillVersionId,
@@ -137,9 +142,7 @@ public class ReviewService {
 
         Skill skill = skillRepository.findById(skillVersion.getSkillId())
                 .orElseThrow(() -> new DomainNotFoundException("skill.not_found", skillVersion.getSkillId()));
-        Namespace namespace = namespaceRepository.findById(skill.getNamespaceId())
-                .orElseThrow(() -> new DomainNotFoundException("namespace.not_found", skill.getNamespaceId()));
-        assertNamespaceActive(namespace);
+        submissionGuard.lock(skill, skillVersion);
 
         // Support both DRAFT (legacy) and UPLOADED (new flow) status
         if (skillVersion.getStatus() != SkillVersionStatus.DRAFT
@@ -147,10 +150,11 @@ public class ReviewService {
             throw new DomainBadRequestException("review.submit.not_draft", skillVersionId);
         }
 
-        if (!permissionChecker.canSubmitReview(skill.getNamespaceId(), userNamespaceRoles)) {
+        if (!permissionChecker.canSubmitReview(skill, userId, userNamespaceRoles)) {
             throw new DomainForbiddenException("review.submit.no_permission");
         }
 
+        permissionChecker.assertCandidateVisibility(skill, skillVersion);
         skillVersion.setStatus(SkillVersionStatus.PENDING_REVIEW);
         skillVersionRepository.save(skillVersion);
 
@@ -175,15 +179,11 @@ public class ReviewService {
     public ReviewTask approveReview(Long reviewTaskId, String reviewerId, String comment,
                                     Map<Long, NamespaceRole> userNamespaceRoles,
                                     Set<String> platformRoles) {
-        ReviewTask task = reviewTaskRepository.findById(reviewTaskId)
-                .orElseThrow(() -> new DomainNotFoundException("review_task.not_found", reviewTaskId));
-
-        if (task.getStatus() != ReviewTaskStatus.PENDING) {
-            throw new DomainBadRequestException("review.not_pending", reviewTaskId);
-        }
+        ReviewTask task = lockReviewCandidate(reviewTaskId);
 
         Namespace namespace = namespaceRepository.findById(task.getNamespaceId())
                 .orElseThrow(() -> new DomainNotFoundException("namespace.not_found", task.getNamespaceId()));
+        entityManager.refresh(namespace, LockModeType.PESSIMISTIC_READ);
         assertNamespaceActive(namespace);
 
         if (!permissionChecker.canReview(task, reviewerId, namespace.getType(),
@@ -191,12 +191,11 @@ public class ReviewService {
             throw new DomainForbiddenException("review.no_permission");
         }
 
-        SkillVersion skillVersion = skillVersionRepository.findById(task.getSkillVersionId())
-                .orElseThrow(() -> new DomainNotFoundException("skill_version.not_found", task.getSkillVersionId()));
-        if (skillVersion.getStatus() == SkillVersionStatus.SCANNING) {
-            throw new DomainBadRequestException("review.approve.scan_in_progress", reviewTaskId);
-        }
+        Candidate candidate = lockCandidateVersion(task);
+        SkillVersion skillVersion = candidate.version();
+        Skill skill = candidate.skill();
 
+        permissionChecker.assertCandidateVisibility(skill, skillVersion);
         int updated = reviewTaskRepository.updateStatusWithVersion(
                 reviewTaskId, ReviewTaskStatus.APPROVED, reviewerId, comment, task.getVersion());
         if (updated == 0) {
@@ -204,9 +203,6 @@ public class ReviewService {
         }
         syncReviewTaskState(task, ReviewTaskStatus.APPROVED, reviewerId, comment);
         entityManager.detach(task);
-
-        Skill skill = skillRepository.findById(skillVersion.getSkillId())
-                .orElseThrow(() -> new DomainNotFoundException("skill.not_found", skillVersion.getSkillId()));
 
         // Check no other owner has a published skill with the same slug
         List<Skill> sameSlugSkills = skillRepository.findByNamespaceIdAndSlug(skill.getNamespaceId(), skill.getSlug());
@@ -258,21 +254,21 @@ public class ReviewService {
     public ReviewTask rejectReview(Long reviewTaskId, String reviewerId, String comment,
                                    Map<Long, NamespaceRole> userNamespaceRoles,
                                    Set<String> platformRoles) {
-        ReviewTask task = reviewTaskRepository.findById(reviewTaskId)
-                .orElseThrow(() -> new DomainNotFoundException("review_task.not_found", reviewTaskId));
-
-        if (task.getStatus() != ReviewTaskStatus.PENDING) {
-            throw new DomainBadRequestException("review.not_pending", reviewTaskId);
-        }
+        ReviewTask task = lockReviewCandidate(reviewTaskId);
 
         Namespace namespace = namespaceRepository.findById(task.getNamespaceId())
                 .orElseThrow(() -> new DomainNotFoundException("namespace.not_found", task.getNamespaceId()));
+        entityManager.refresh(namespace, LockModeType.PESSIMISTIC_READ);
         assertNamespaceActive(namespace);
 
         if (!permissionChecker.canReview(task, reviewerId, namespace.getType(),
                 userNamespaceRoles, platformRoles)) {
             throw new DomainForbiddenException("review.no_permission");
         }
+
+        Candidate candidate = lockCandidateVersion(task);
+        SkillVersion skillVersion = candidate.version();
+        Skill skill = candidate.skill();
 
         int updated = reviewTaskRepository.updateStatusWithVersion(
                 reviewTaskId, ReviewTaskStatus.REJECTED, reviewerId, comment, task.getVersion());
@@ -282,10 +278,6 @@ public class ReviewService {
         syncReviewTaskState(task, ReviewTaskStatus.REJECTED, reviewerId, comment);
         entityManager.detach(task);
 
-        SkillVersion skillVersion = skillVersionRepository.findById(task.getSkillVersionId())
-                .orElseThrow(() -> new DomainNotFoundException("skill_version.not_found", task.getSkillVersionId()));
-        Skill skill = skillRepository.findById(skillVersion.getSkillId())
-                .orElseThrow(() -> new DomainNotFoundException("skill.not_found", skillVersion.getSkillId()));
         skillVersion.setStatus(SkillVersionStatus.REJECTED);
         skillVersionRepository.save(skillVersion);
         eventPublisher.publishEvent(new ReviewRejectedEvent(
@@ -305,7 +297,7 @@ public class ReviewService {
 
     /**
      * Withdraws a previously submitted review request and puts the version back
-     * into draft so the owner can amend and resubmit it.
+     * into UPLOADED so the submitter can amend and resubmit it.
      */
     @Transactional
     public SkillVersion withdrawReview(Long skillVersionId, String userId) {
@@ -313,20 +305,38 @@ public class ReviewService {
                         skillVersionId, ReviewTaskStatus.PENDING)
                 .orElseThrow(() -> new DomainNotFoundException("review_task.not_found_for_version", skillVersionId));
 
+        return withdrawReviewCandidate(task, skillVersionId, userId);
+    }
+
+    /** Keep the requested review identity; an old round must not cancel its successor. */
+    @Transactional
+    public SkillVersion withdrawReviewTask(Long reviewTaskId, String userId) {
+        ReviewTask task = reviewTaskRepository.findById(reviewTaskId)
+                .orElseThrow(() -> new DomainNotFoundException("review_task.not_found", reviewTaskId));
+        return withdrawReviewCandidate(task, task.getSkillVersionId(), userId);
+    }
+
+    private SkillVersion withdrawReviewCandidate(ReviewTask task, Long skillVersionId, String userId) {
+        task = lockReviewCandidate(task);
+        if (!Objects.equals(task.getSkillVersionId(), skillVersionId)) {
+            throw new DomainBadRequestException("review.candidate.mismatch");
+        }
         if (!task.getSubmittedBy().equals(userId)) {
             throw new DomainForbiddenException("review.withdraw.not_submitter");
         }
 
-        reviewTaskRepository.delete(task);
-
-        SkillVersion skillVersion = skillVersionRepository.findById(skillVersionId)
-                .orElseThrow(() -> new DomainNotFoundException("skill_version.not_found", skillVersionId));
-        Skill skill = skillRepository.findById(skillVersion.getSkillId())
-                .orElseThrow(() -> new DomainNotFoundException("skill.not_found", skillVersion.getSkillId()));
-        Namespace namespace = namespaceRepository.findById(skill.getNamespaceId())
-                .orElseThrow(() -> new DomainNotFoundException("namespace.not_found", skill.getNamespaceId()));
+        Long namespaceId = task.getNamespaceId();
+        Namespace namespace = namespaceRepository.findById(namespaceId)
+                .orElseThrow(() -> new DomainNotFoundException("namespace.not_found", namespaceId));
+        entityManager.refresh(namespace, LockModeType.PESSIMISTIC_READ);
         assertNamespaceActive(namespace);
-        return skillGovernanceService.withdrawPendingVersion(skill, skillVersion, userId);
+        Candidate candidate = lockCandidateVersion(task);
+        if (!permissionChecker.canWithdrawReview(task, userId)) {
+            throw new DomainForbiddenException("review.no_permission");
+        }
+
+        reviewTaskRepository.delete(task);
+        return skillGovernanceService.withdrawPendingVersion(candidate.skill(), candidate.version(), userId);
     }
 
     public boolean canReviewNamespace(ReviewTask task,
@@ -358,6 +368,62 @@ public class ReviewService {
         } catch (Exception e) {
             throw new IllegalStateException("Failed to deserialize skill metadata", e);
         }
+    }
+
+    /** Refresh is essential: app orchestration may already have loaded these entities.
+     * Row locks last until the enclosing decision/audit transaction completes. */
+    private ReviewTask lockReviewCandidate(Long reviewTaskId) {
+        ReviewTask task = reviewTaskRepository.findById(reviewTaskId)
+                .orElseThrow(() -> new DomainNotFoundException("review_task.not_found", reviewTaskId));
+        return lockReviewCandidate(task);
+    }
+
+    private ReviewTask lockReviewCandidate(ReviewTask task) {
+        try {
+            entityManager.refresh(task, LockModeType.PESSIMISTIC_WRITE);
+        } catch (jakarta.persistence.EntityNotFoundException deleted) {
+            throw new DomainNotFoundException("review_task.not_found", task.getId());
+        }
+        if (task.getStatus() != ReviewTaskStatus.PENDING) {
+            throw new DomainBadRequestException("review.not_pending", task.getId());
+        }
+        if (task.getSubjectType() != ReviewSubjectType.SKILL_VERSION
+                || task.getSkillId() == null || task.getSkillVersionId() == null
+                || task.getSkillVersion() == null || task.getSkillVersion().isBlank()
+                || !Objects.equals(task.getSkillId(), task.getSubjectId())
+                || !Objects.equals(task.getSkillVersionId(), task.getSubjectVersionId())
+                || !Objects.equals(task.getSkillVersion(), task.getSubjectVersion())) {
+            throw new DomainBadRequestException("review.candidate.mismatch");
+        }
+        return task;
+    }
+
+    private record Candidate(Skill skill, SkillVersion version) {}
+
+    private Candidate lockCandidateVersion(ReviewTask task) {
+        SkillVersion version = skillVersionRepository.findById(task.getSkillVersionId())
+                .orElseThrow(() -> new DomainNotFoundException("skill_version.not_found", task.getSkillVersionId()));
+        entityManager.refresh(version, LockModeType.PESSIMISTIC_WRITE);
+        if (!Objects.equals(task.getSkillId(), version.getSkillId())
+                || !Objects.equals(task.getSkillVersion(), version.getVersion())) {
+            throw new DomainBadRequestException("review.candidate.mismatch");
+        }
+        if (version.getStatus() == SkillVersionStatus.SCANNING) {
+            throw new DomainBadRequestException("review.approve.scan_in_progress", task.getId());
+        }
+        if (version.getStatus() != SkillVersionStatus.PENDING_REVIEW) {
+            throw new DomainBadRequestException("review.candidate.not_pending");
+        }
+        Skill skill = skillRepository.findById(task.getSkillId())
+                .orElseThrow(() -> new DomainNotFoundException("skill.not_found", task.getSkillId()));
+        entityManager.refresh(skill, LockModeType.PESSIMISTIC_WRITE);
+        if (!Objects.equals(task.getNamespaceId(), skill.getNamespaceId())) {
+            throw new DomainBadRequestException("review.candidate.mismatch");
+        }
+        if (skill.getStatus() == SkillStatus.ARCHIVED) {
+            throw new DomainBadRequestException("error.skill.publish.archived", skill.getSlug());
+        }
+        return new Candidate(skill, version);
     }
 
     private void assertNamespaceActive(Namespace namespace) {

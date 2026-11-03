@@ -4,6 +4,16 @@ import com.iflytek.skillhub.domain.audit.AuditDetail;
 import com.iflytek.skillhub.domain.audit.AuditLogService;
 import com.iflytek.skillhub.domain.event.SkillStatusChangedEvent;
 import com.iflytek.skillhub.domain.namespace.NamespaceRole;
+import com.iflytek.skillhub.domain.namespace.Namespace;
+import com.iflytek.skillhub.domain.namespace.NamespaceRepository;
+import com.iflytek.skillhub.domain.namespace.NamespaceStatus;
+import com.iflytek.skillhub.domain.review.ReviewTaskStatus;
+import com.iflytek.skillhub.domain.review.ReviewSubjectType;
+import com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import jakarta.persistence.LockModeType;
+import java.util.Objects;
 import com.iflytek.skillhub.domain.review.ReviewTaskRepository;
 import com.iflytek.skillhub.domain.security.SecurityScanService;
 import com.iflytek.skillhub.domain.shared.exception.DomainBadRequestException;
@@ -34,6 +44,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 /**
  * Handles governance-oriented mutations on skills and versions, including
  * hiding, archiving, restoring, and destructive cleanup.
+ * EntityManager refresh is required for deletion because callers may have loaded stale entities
+ * before a competing transaction committed. Locks live through the enclosing audit transaction.
  */
 @Service
 public class SkillGovernanceService {
@@ -50,6 +62,9 @@ public class SkillGovernanceService {
     private final SecurityScanService securityScanService;
     private final SkillStorageDeletionCompensationService compensationService;
     private final Clock clock;
+    private final NamespaceRepository namespaceRepository;
+    private final SlarkAssetAuthorization slarkAssetAuthorization;
+    @PersistenceContext private EntityManager entityManager;
 
     public SkillGovernanceService(SkillRepository skillRepository,
                                   SkillVersionRepository skillVersionRepository,
@@ -60,7 +75,8 @@ public class SkillGovernanceService {
                                   ApplicationEventPublisher eventPublisher,
                                   SecurityScanService securityScanService,
                                   SkillStorageDeletionCompensationService compensationService,
-                                  Clock clock) {
+                                  Clock clock, NamespaceRepository namespaceRepository,
+                                  SlarkAssetAuthorization slarkAssetAuthorization) {
         this.skillRepository = skillRepository;
         this.skillVersionRepository = skillVersionRepository;
         this.skillFileRepository = skillFileRepository;
@@ -71,12 +87,13 @@ public class SkillGovernanceService {
         this.securityScanService = securityScanService;
         this.compensationService = compensationService;
         this.clock = clock;
+        this.namespaceRepository = namespaceRepository;
+        this.slarkAssetAuthorization = slarkAssetAuthorization;
     }
 
     @Transactional
     public Skill hideSkill(Long skillId, String actorUserId, String clientIp, String userAgent, String reason) {
-        Skill skill = skillRepository.findById(skillId)
-            .orElseThrow(() -> new DomainNotFoundException("error.skill.notFound", skillId));
+        Skill skill = lockAsset(skillId, actorUserId);
         skill.setHidden(true);
         skill.setHiddenAt(currentInstant());
         skill.setHiddenBy(actorUserId);
@@ -93,8 +110,7 @@ public class SkillGovernanceService {
                               String clientIp,
                               String userAgent,
                               String reason) {
-        Skill skill = skillRepository.findById(skillId)
-                .orElseThrow(() -> new DomainNotFoundException("error.skill.notFound", skillId));
+        Skill skill = lockAsset(skillId, actorUserId);
         assertCanManageLifecycle(skill, actorUserId, userNamespaceRoles);
         return archiveSkillInternal(skill, actorUserId, clientIp, userAgent, reason);
     }
@@ -105,8 +121,7 @@ public class SkillGovernanceService {
                                      String clientIp,
                                      String userAgent,
                                      String reason) {
-        Skill skill = skillRepository.findById(skillId)
-                .orElseThrow(() -> new DomainNotFoundException("error.skill.notFound", skillId));
+        Skill skill = lockAsset(skillId, actorUserId);
         return archiveSkillInternal(skill, actorUserId, clientIp, userAgent, reason);
     }
 
@@ -126,8 +141,7 @@ public class SkillGovernanceService {
 
     @Transactional
     public Skill unhideSkill(Long skillId, String actorUserId, String clientIp, String userAgent) {
-        Skill skill = skillRepository.findById(skillId)
-            .orElseThrow(() -> new DomainNotFoundException("error.skill.notFound", skillId));
+        Skill skill = lockAsset(skillId, actorUserId);
         skill.setHidden(false);
         skill.setHiddenAt(null);
         skill.setHiddenBy(null);
@@ -143,8 +157,7 @@ public class SkillGovernanceService {
                                 Map<Long, NamespaceRole> userNamespaceRoles,
                                 String clientIp,
                                 String userAgent) {
-        Skill skill = skillRepository.findById(skillId)
-                .orElseThrow(() -> new DomainNotFoundException("error.skill.notFound", skillId));
+        Skill skill = lockAsset(skillId, actorUserId);
         assertCanManageLifecycle(skill, actorUserId, userNamespaceRoles);
 
         SkillStatus previousStatus = skill.getStatus();
@@ -164,7 +177,61 @@ public class SkillGovernanceService {
                               String clientIp,
                               String userAgent,
                               String namespaceSlug) {
-        assertCanManageLifecycle(skill, actorUserId, userNamespaceRoles);
+        // Match review decision order: task(s) -> namespace -> version -> skill -> scan audit.
+        // Lock only this candidate: holding every version before its task would invert review locks.
+        Long expectedSkillId = skill.getId();
+        Long expectedNamespaceId = skill.getNamespaceId();
+        Long expectedVersionId = version.getId();
+        String expectedVersion = version.getVersion();
+        var history = reviewTaskRepository.findBySkillVersionIdOrderByIdAsc(expectedVersionId);
+        for (var task : history) {
+            refreshForDeletion(task, LockModeType.PESSIMISTIC_WRITE, expectedVersionId);
+            if (task.getSubjectType() != ReviewSubjectType.SKILL_VERSION
+                    || !Objects.equals(task.getNamespaceId(), expectedNamespaceId)
+                    || !Objects.equals(task.getSkillId(), expectedSkillId)
+                    || !Objects.equals(task.getSubjectId(), expectedSkillId)
+                    || !Objects.equals(task.getSkillVersionId(), expectedVersionId)
+                    || !Objects.equals(task.getSubjectVersionId(), expectedVersionId)
+                    || !Objects.equals(task.getSkillVersion(), expectedVersion)
+                    || !Objects.equals(task.getSubjectVersion(), expectedVersion)) {
+                throw new DomainBadRequestException("review.candidate.mismatch");
+            }
+        }
+        Namespace namespace = namespaceRepository.findById(expectedNamespaceId)
+                .orElseThrow(() -> new DomainNotFoundException("error.namespace.notFound", expectedNamespaceId));
+        refreshForDeletion(namespace, LockModeType.PESSIMISTIC_READ, expectedVersionId);
+        version = skillVersionRepository.findById(expectedVersionId)
+                .orElseThrow(() -> new DomainNotFoundException("error.skill.version.notFound", expectedVersionId));
+        refreshForDeletion(version, LockModeType.PESSIMISTIC_WRITE, expectedVersionId);
+        skill = skillRepository.findById(expectedSkillId)
+                .orElseThrow(() -> new DomainNotFoundException("error.skill.notFound", expectedSkillId));
+        refreshForDeletion(skill, LockModeType.PESSIMISTIC_WRITE, expectedVersionId);
+        if (!Objects.equals(expectedSkillId, version.getSkillId())
+                || !Objects.equals(expectedNamespaceId, skill.getNamespaceId())
+                || !Objects.equals(expectedVersion, version.getVersion())
+                || !Objects.equals(namespace.getSlug(), namespaceSlug.startsWith("@") ? namespaceSlug.substring(1) : namespaceSlug)) {
+            throw new DomainBadRequestException("review.candidate.mismatch");
+        }
+        var eligibility = slarkAssetAuthorization.can(SlarkAssetAuthorization.Operation.SUBMIT,
+                skill.getNamespaceId(), skill.getId(), actorUserId);
+        if (eligibility.isPresent()) {
+            if (!eligibility.get()) throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+        } else {
+            assertCanManageLifecycle(skill, actorUserId, userNamespaceRoles);
+        }
+        if (namespace.getStatus() == NamespaceStatus.FROZEN) {
+            throw new DomainBadRequestException("error.namespace.frozen", namespace.getSlug());
+        }
+        if (namespace.getStatus() == NamespaceStatus.ARCHIVED) {
+            throw new DomainBadRequestException("error.namespace.archived", namespace.getSlug());
+        }
+        // Native governance supports cleanup of archived assets; bound assets remain read-only.
+        if (eligibility.isPresent() && skill.getStatus() == SkillStatus.ARCHIVED) {
+            throw new DomainBadRequestException("error.skill.publish.archived", skill.getSlug());
+        }
+        if (history.stream().anyMatch(task -> task.getStatus() == ReviewTaskStatus.PENDING)) {
+            throw new DomainBadRequestException("error.skill.version.delete.unsupported", version.getVersion());
+        }
         if (version.getStatus() != SkillVersionStatus.DRAFT
                 && version.getStatus() != SkillVersionStatus.REJECTED
                 && version.getStatus() != SkillVersionStatus.SCAN_FAILED
@@ -178,7 +245,9 @@ public class SkillGovernanceService {
         }
 
         // Rejected versions retain terminal review history whose FK must not outlive the version.
-        reviewTaskRepository.deleteBySkillVersionIdIn(List.of(version.getId()));
+        // Delete exactly the locked history; a newly inserted reference must fail/rollback through
+        // its FK, never acquire an unseen task lock after holding the version row.
+        history.forEach(reviewTaskRepository::delete);
         List<SkillFile> files = skillFileRepository.findByVersionId(version.getId());
         List<String> storageKeys = new ArrayList<>();
         files.stream()
@@ -208,6 +277,14 @@ public class SkillGovernanceService {
                 userAgent,
                 AuditDetail.of("version", version.getVersion())
         );
+    }
+
+    private void refreshForDeletion(Object entity, LockModeType mode, Long versionId) {
+        try {
+            entityManager.refresh(entity, mode);
+        } catch (jakarta.persistence.EntityNotFoundException deleted) {
+            throw new DomainNotFoundException("error.skill.version.notFound", versionId);
+        }
     }
 
     private void deleteStorageAfterCommit(Skill skill, String namespaceSlug, List<String> storageKeys) {
@@ -266,8 +343,11 @@ public class SkillGovernanceService {
      */
     @Transactional
     public SkillVersion yankVersion(Long versionId, String actorUserId, String clientIp, String userAgent, String reason) {
-        SkillVersion version = skillVersionRepository.findByIdForUpdate(versionId)
+        SkillVersion version = skillVersionRepository.findById(versionId)
             .orElseThrow(() -> new DomainNotFoundException("error.skill.version.notFound", versionId));
+        Skill skill = skillRepository.findById(version.getSkillId())
+            .orElseThrow(() -> new DomainNotFoundException("error.skill.notFound", version.getSkillId()));
+        lockVersion(skill, version, actorUserId);
         return yankVersionInternal(version, actorUserId, clientIp, userAgent, reason);
     }
 
@@ -284,6 +364,7 @@ public class SkillGovernanceService {
                                     String clientIp,
                                     String userAgent,
                                     String reason) {
+        lockVersion(skill, version, actorUserId);
         assertCanManageLifecycle(skill, actorUserId, userNamespaceRoles);
         return yankVersionInternal(version, actorUserId, clientIp, userAgent, reason);
     }
@@ -326,9 +407,72 @@ public class SkillGovernanceService {
                 .orElse(null);
     }
 
+    private Skill lockAsset(Long skillId, String actorUserId) {
+        Skill skill = skillRepository.findById(skillId)
+                .orElseThrow(() -> new DomainNotFoundException("error.skill.notFound", skillId));
+        Long namespaceId = skill.getNamespaceId();
+        String slug = skill.getSlug();
+        lockNamespace(namespaceId);
+        refreshForDeletion(skill, LockModeType.PESSIMISTIC_WRITE, skillId);
+        assertCandidate(skill, namespaceId, slug);
+        assertCurrentGovernancePermission(skill, actorUserId);
+        return skill;
+    }
+
+    private void lockVersion(Skill skill, SkillVersion version, String actorUserId) {
+        Long namespaceId = skill.getNamespaceId();
+        String slug = skill.getSlug();
+        String versionName = version.getVersion();
+        if (!Objects.equals(version.getSkillId(), skill.getId())) {
+            throw new DomainBadRequestException("review.candidate.mismatch");
+        }
+        lockNamespace(namespaceId);
+        refreshForDeletion(version, LockModeType.PESSIMISTIC_WRITE, version.getId());
+        refreshForDeletion(skill, LockModeType.PESSIMISTIC_WRITE, version.getId());
+        assertCandidate(skill, namespaceId, slug);
+        if (!Objects.equals(version.getSkillId(), skill.getId())
+                || !Objects.equals(versionName, version.getVersion())) {
+            throw new DomainBadRequestException("review.candidate.mismatch");
+        }
+        assertCurrentGovernancePermission(skill, actorUserId);
+    }
+
+    private Namespace lockNamespace(Long namespaceId) {
+        Namespace namespace = namespaceRepository.findById(namespaceId)
+                .orElseThrow(() -> new DomainNotFoundException("error.namespace.notFound", namespaceId));
+        refreshForDeletion(namespace, LockModeType.PESSIMISTIC_READ, namespaceId);
+        if (namespace.getStatus() == NamespaceStatus.FROZEN) {
+            throw new DomainBadRequestException("error.namespace.frozen", namespace.getSlug());
+        }
+        if (namespace.getStatus() == NamespaceStatus.ARCHIVED) {
+            throw new DomainBadRequestException("error.namespace.archived", namespace.getSlug());
+        }
+        return namespace;
+    }
+
+    private void assertCandidate(Skill skill, Long namespaceId, String slug) {
+        if (!Objects.equals(namespaceId, skill.getNamespaceId()) || !Objects.equals(slug, skill.getSlug())) {
+            throw new DomainBadRequestException("review.candidate.mismatch");
+        }
+    }
+
+    private void assertCurrentGovernancePermission(Skill skill, String actorUserId) {
+        var eligibility = slarkAssetAuthorization.can(SlarkAssetAuthorization.Operation.SUBMIT,
+                skill.getNamespaceId(), skill.getId(), actorUserId);
+        if (eligibility.isPresent() && !eligibility.get()) {
+            throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+        }
+    }
+
     private void assertCanManageLifecycle(Skill skill,
                                           String actorUserId,
                                           Map<Long, NamespaceRole> userNamespaceRoles) {
+        var eligibility = slarkAssetAuthorization.can(SlarkAssetAuthorization.Operation.SUBMIT,
+                skill.getNamespaceId(), skill.getId(), actorUserId);
+        if (eligibility.isPresent()) {
+            if (!eligibility.get()) throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+            return;
+        }
         NamespaceRole namespaceRole = userNamespaceRoles.get(skill.getNamespaceId());
         boolean canManage = skill.getOwnerId().equals(actorUserId)
                 || namespaceRole == NamespaceRole.ADMIN

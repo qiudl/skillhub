@@ -28,6 +28,7 @@ public class PromotionRevocationService {
     private final NamespaceRepository namespaceRepository;
     private final SkillHardDeleteService hardDeleteService;
     private final Clock clock;
+    private final PromotionMutationGuard mutationGuard;
 
     public PromotionRevocationService(PromotionRequestRepository promotionRepository,
                                       PromotionRevocationRequestRepository revocationRepository,
@@ -35,7 +36,7 @@ public class PromotionRevocationService {
                                       SkillRepository skillRepository,
                                       NamespaceRepository namespaceRepository,
                                       SkillHardDeleteService hardDeleteService,
-                                      Clock clock) {
+                                      Clock clock, PromotionMutationGuard mutationGuard) {
         this.promotionRepository = promotionRepository;
         this.revocationRepository = revocationRepository;
         this.historyRepository = historyRepository;
@@ -43,6 +44,7 @@ public class PromotionRevocationService {
         this.namespaceRepository = namespaceRepository;
         this.hardDeleteService = hardDeleteService;
         this.clock = clock;
+        this.mutationGuard = mutationGuard;
     }
 
     @Transactional
@@ -57,6 +59,11 @@ public class PromotionRevocationService {
         PromotionRequest initial = promotionRepository.findActiveInitialBySourceSkillId(sourceSkillId)
                 .orElseThrow(() -> new DomainBadRequestException("promotion.revocation.not_active"));
         Skill target = validatedTarget(initial, source);
+        mutationGuard.revocation(source,target);
+        if (!canSubmit(source, actorId, namespaceRoles, platformRoles)) {
+            throw new DomainForbiddenException("promotion.revocation.submit_no_permission");
+        }
+        target = validatedTarget(initial,source);
         if (revocationRepository.existsByTargetSkillIdAndStatus(target.getId(), ReviewTaskStatus.PENDING)) {
             throw new DomainBadRequestException("promotion.revocation.duplicate_pending");
         }
@@ -76,9 +83,17 @@ public class PromotionRevocationService {
     public PromotionRevocationRequest approve(Long requestId, String reviewerId,
                                                Set<String> platformRoles,
                                                String comment, String clientIp, String userAgent) {
+        return approve(requestId,reviewerId,platformRoles,comment,clientIp,userAgent,id -> {});
+    }
+
+    @Transactional
+    public PromotionRevocationRequest approve(Long requestId, String reviewerId,
+                                               Set<String> platformRoles, String comment,
+                                               String clientIp, String userAgent,
+                                               java.util.function.Consumer<Long> beforeTargetDeletion) {
         PromotionRevocationRequest request = pendingRequest(requestId);
         assertReviewer(request, reviewerId, platformRoles, false);
-        executeApproval(request, reviewerId, comment, clientIp, userAgent);
+        executeApproval(request, reviewerId, comment, clientIp, userAgent,beforeTargetDeletion);
         return request;
     }
 
@@ -95,6 +110,14 @@ public class PromotionRevocationService {
     public PromotionRevocationRequest revokeDirect(Long sourceSkillId, String administratorId,
                                                     Set<String> platformRoles, String reason,
                                                     String clientIp, String userAgent) {
+        return revokeDirect(sourceSkillId,administratorId,platformRoles,reason,clientIp,userAgent,id -> {});
+    }
+
+    @Transactional
+    public PromotionRevocationRequest revokeDirect(Long sourceSkillId, String administratorId,
+                                                    Set<String> platformRoles, String reason,
+                                                    String clientIp, String userAgent,
+                                                    java.util.function.Consumer<Long> beforeTargetDeletion) {
         if (!isPlatformAdmin(platformRoles)) {
             throw new DomainForbiddenException("promotion.revocation.review_no_permission");
         }
@@ -106,18 +129,28 @@ public class PromotionRevocationService {
         var pending = revocationRepository.findByTargetSkillIdAndStatus(target.getId(), ReviewTaskStatus.PENDING);
         if (pending.isPresent()) {
             PromotionRevocationRequest request = pending.get();
-            executeApproval(request, administratorId, reason, clientIp, userAgent);
+            executeApproval(request, administratorId, reason, clientIp, userAgent,beforeTargetDeletion);
             return request;
         }
         PromotionRevocationRequest request = submit(sourceSkillId, administratorId,
                 Map.of(), platformRoles, reason);
-        executeApproval(request, administratorId, reason, clientIp, userAgent);
+        executeApproval(request, administratorId, reason, clientIp, userAgent,beforeTargetDeletion);
         return request;
     }
 
     private void executeApproval(PromotionRevocationRequest request, String reviewerId,
-                                 String comment, String clientIp, String userAgent) {
+                                 String comment, String clientIp, String userAgent,
+                                 java.util.function.Consumer<Long> beforeTargetDeletion) {
+        mutationGuard.request(request);
+        if (request.getStatus()!=ReviewTaskStatus.PENDING) {
+            throw new DomainBadRequestException("promotion.revocation.not_pending",request.getId());
+        }
         Long targetId = request.getTargetSkillId();
+        Skill candidateSource = skillRepository.findById(request.getSourceSkillId())
+                .orElseThrow(() -> new DomainBadRequestException("promotion.revocation.not_active"));
+        Skill candidateTarget = skillRepository.findById(targetId)
+                .orElseThrow(() -> new DomainBadRequestException("promotion.revocation.not_active"));
+        mutationGuard.revocation(candidateSource,candidateTarget);
         if (!historyRepository.lockTarget(targetId)) {
             throw new DomainBadRequestException("promotion.revocation.not_active");
         }
@@ -140,6 +173,9 @@ public class PromotionRevocationService {
             throw new DomainBadRequestException("promotion.revocation.target_changed");
         }
 
+        // PostgreSQL search rows reference the target; remove them in this transaction,
+        // after graph locks and authorization, before deleting the referenced asset.
+        beforeTargetDeletion.accept(targetId);
         Instant now = Instant.now(clock);
         int detached = historyRepository.detachTarget(targetId, reviewerId, now);
         if (detached < 1) {
@@ -170,6 +206,7 @@ public class PromotionRevocationService {
     private PromotionRevocationRequest pendingRequest(Long id) {
         PromotionRevocationRequest request = revocationRepository.findById(id)
                 .orElseThrow(() -> new DomainNotFoundException("promotion.revocation.not_found", id));
+        mutationGuard.request(request);
         if (request.getStatus() != ReviewTaskStatus.PENDING) {
             throw new DomainBadRequestException("promotion.revocation.not_pending", id);
         }

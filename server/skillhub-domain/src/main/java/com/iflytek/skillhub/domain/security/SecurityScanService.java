@@ -7,6 +7,8 @@ import com.iflytek.skillhub.domain.skill.SkillVersion;
 import com.iflytek.skillhub.domain.skill.SkillVersionRepository;
 import com.iflytek.skillhub.domain.skill.SkillVersionStatus;
 import com.iflytek.skillhub.domain.skill.validation.PackageEntry;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -40,6 +42,7 @@ public class SecurityScanService {
     private final ObjectMapper objectMapper;
     private final String scanMode;
     private final boolean enabled;
+    private final EntityManager entityManager;
 
     @Autowired
     public SecurityScanService(SecurityAuditRepository auditRepository,
@@ -48,7 +51,8 @@ public class SecurityScanService {
                                ObjectMapper objectMapper,
                                @Value("${skillhub.security.scanner.mode:local}") String scanMode,
                                @Value("${skillhub.security.scanner.enabled:false}") boolean enabled,
-                               ScanTaskOutboxRepository scanTaskOutboxRepository) {
+                               ScanTaskOutboxRepository scanTaskOutboxRepository,
+                               EntityManager entityManager) {
         this.auditRepository = auditRepository;
         this.skillVersionRepository = skillVersionRepository;
         this.scanTaskProducer = scanTaskProducer;
@@ -56,6 +60,7 @@ public class SecurityScanService {
         this.scanMode = scanMode;
         this.enabled = enabled;
         this.scanTaskOutboxRepository = scanTaskOutboxRepository;
+        this.entityManager = entityManager;
     }
 
     public SecurityScanService(SecurityAuditRepository auditRepository,
@@ -63,8 +68,9 @@ public class SecurityScanService {
                                ScanTaskProducer scanTaskProducer,
                                ObjectMapper objectMapper,
                                String scanMode,
-                               boolean enabled) {
-        this(auditRepository, skillVersionRepository, scanTaskProducer, objectMapper, scanMode, enabled, null);
+                               boolean enabled,
+                               EntityManager entityManager) {
+        this(auditRepository, skillVersionRepository, scanTaskProducer, objectMapper, scanMode, enabled, null, entityManager);
     }
 
     public boolean isEnabled() {
@@ -76,6 +82,7 @@ public class SecurityScanService {
         if (!enabled) {
             throw new IllegalStateException("Security scanner is disabled");
         }
+        version = lockVersion(version.getId());
         if (version.getStatus() != SkillVersionStatus.SCAN_FAILED) {
             throw new IllegalStateException("Only SCAN_FAILED versions can be retried");
         }
@@ -144,11 +151,14 @@ public class SecurityScanService {
 
     @Transactional
     public void processScanFailure(String taskId, Long versionId, ScannerType scannerType, String reason) {
-        SecurityAudit audit = auditRepository.findByTaskId(taskId)
-                .filter(candidate -> candidate.getSkillVersionId().equals(versionId))
-                .filter(candidate -> candidate.getScannerType() == scannerType)
-                .orElseThrow(() -> new IllegalStateException("SecurityAudit not found for taskId=" + taskId));
-        if (audit.getScannedAt() != null) {
+        SkillVersion version = lockVersionIfPresent(versionId);
+        // Whole-asset deletion removes both the version and its audit attempts.
+        // A late delivery must not retry forever after that transaction commits.
+        if (version == null && auditRepository.findByTaskId(taskId).isEmpty()) {
+            return;
+        }
+        SecurityAudit audit = lockAttempt(taskId, versionId, scannerType);
+        if (audit.getScannedAt() != null || audit.isDeleted()) {
             return;
         }
         audit.markFailed(Instant.now(Clock.systemUTC()), reason);
@@ -161,12 +171,10 @@ public class SecurityScanService {
         if (!currentAttempt) {
             return;
         }
-        skillVersionRepository.findById(versionId)
-                .filter(version -> version.getStatus() == SkillVersionStatus.SCANNING)
-                .ifPresent(version -> {
-                    version.setStatus(SkillVersionStatus.SCAN_FAILED);
-                    skillVersionRepository.save(version);
-                });
+        if (version != null && version.getStatus() == SkillVersionStatus.SCANNING) {
+            version.setStatus(SkillVersionStatus.SCAN_FAILED);
+            skillVersionRepository.save(version);
+        }
     }
 
     @Transactional
@@ -174,14 +182,20 @@ public class SecurityScanService {
                                   Long versionId,
                                   ScannerType scannerType,
                                   SecurityScanResponse response) {
-        SecurityAudit audit = auditRepository.findByTaskId(taskId)
-                .filter(candidate -> candidate.getSkillVersionId().equals(versionId))
-                .filter(candidate -> candidate.getScannerType() == scannerType)
-                .orElseThrow(() -> new IllegalStateException(
-                        "SecurityAudit not found for taskId=" + taskId));
-        SkillVersion version = skillVersionRepository.findById(versionId)
-                .orElseThrow(() -> new IllegalStateException("SkillVersion not found: " + versionId));
+        SkillVersion version = lockVersionIfPresent(versionId);
+        // Whole-asset deletion removes both the version and its audit attempts.
+        // A late delivery must not retry forever after that transaction commits.
+        if (version == null && auditRepository.findByTaskId(taskId).isEmpty()) {
+            return;
+        }
+        SecurityAudit audit = lockAttempt(taskId, versionId, scannerType);
+        if (audit.getScannedAt() != null || audit.isDeleted()) {
+            return;
+        }
 
+        if (version == null) {
+            throw new IllegalStateException("SkillVersion not found: " + versionId);
+        }
         audit.setScanId(response.scanId());
         audit.setVerdict(response.verdict());
         audit.setIsSafe(response.verdict() == SecurityVerdict.SAFE);
@@ -203,10 +217,38 @@ public class SecurityScanService {
             } else {
                 version.setStatus(SkillVersionStatus.PENDING_REVIEW);
             }
-        }
-        if (currentAttempt) {
             skillVersionRepository.save(version);
         }
+    }
+
+    // Retry already holds the version row in the application service. Refresh also protects callers
+    // whose persistence context loaded the version before a competing transaction committed.
+    private SkillVersion lockVersion(Long versionId) {
+        SkillVersion version = lockVersionIfPresent(versionId);
+        if (version == null) {
+            throw new IllegalStateException("SkillVersion not found: " + versionId);
+        }
+        return version;
+    }
+
+    private SkillVersion lockVersionIfPresent(Long versionId) {
+        // Query under lock first: a delete committed while waiting returns empty, without a
+        // refresh exception marking the callback transaction rollback-only. Refresh still replaces
+        // a stale managed instance when the row exists.
+        SkillVersion version = skillVersionRepository.findByIdForUpdate(versionId).orElse(null);
+        if (version != null) entityManager.refresh(version, LockModeType.PESSIMISTIC_WRITE);
+        return version;
+    }
+
+    // Always acquire version before audit, including failures and replayed results.
+    private SecurityAudit lockAttempt(String taskId, Long versionId, ScannerType scannerType) {
+        SecurityAudit audit = auditRepository.findByTaskId(taskId)
+                .orElseThrow(() -> new IllegalStateException("SecurityAudit not found for taskId=" + taskId));
+        entityManager.refresh(audit, LockModeType.PESSIMISTIC_WRITE);
+        if (!audit.getSkillVersionId().equals(versionId) || audit.getScannerType() != scannerType) {
+            throw new IllegalStateException("SecurityAudit does not match version/scanner for taskId=" + taskId);
+        }
+        return audit;
     }
 
     private Path saveTempDirectory(Long versionId, List<PackageEntry> entries) {
@@ -282,7 +324,11 @@ public class SecurityScanService {
             log.debug("No active security audits to soft-delete for versionId={}", versionId);
             return;
         }
-        audits.forEach(SecurityAudit::markAsDeleted);
+        audits.forEach(audit -> {
+            // Preserve a verdict committed after this transaction first loaded the audit.
+            entityManager.refresh(audit, LockModeType.PESSIMISTIC_WRITE);
+            audit.markAsDeleted();
+        });
         auditRepository.saveAll(audits);
         log.info("Soft deleted {} security audit(s) for versionId={}", audits.size(), versionId);
     }

@@ -51,6 +51,7 @@ public class PromotionService {
     private final GovernanceNotificationService governanceNotificationService;
     private final EntityManager entityManager;
     private final Clock clock;
+    private final PromotionMutationGuard mutationGuard;
 
     public PromotionService(PromotionRequestRepository promotionRequestRepository,
                             SkillRepository skillRepository,
@@ -62,7 +63,7 @@ public class PromotionService {
                             ApplicationEventPublisher eventPublisher,
                             GovernanceNotificationService governanceNotificationService,
                             EntityManager entityManager,
-                            Clock clock) {
+                            Clock clock, PromotionMutationGuard mutationGuard) {
         this.promotionRequestRepository = promotionRequestRepository;
         this.skillRepository = skillRepository;
         this.skillVersionRepository = skillVersionRepository;
@@ -74,6 +75,7 @@ public class PromotionService {
         this.governanceNotificationService = governanceNotificationService;
         this.entityManager = entityManager;
         this.clock = clock;
+        this.mutationGuard = mutationGuard;
     }
 
     /**
@@ -120,8 +122,21 @@ public class PromotionService {
             throw new DomainForbiddenException("promotion.submit.no_permission");
         }
 
+
+
         Namespace targetNamespace = namespaceRepository.findById(targetNamespaceId)
                 .orElseThrow(() -> new DomainNotFoundException("namespace.not_found", targetNamespaceId));
+        mutationGuard.submission(sourceSkill,sourceVersion,targetNamespace);
+        if (!sourceVersion.getSkillId().equals(sourceSkillId)
+                || sourceVersion.getStatus()!=SkillVersionStatus.PUBLISHED) {
+            throw new DomainBadRequestException("promotion.version_not_published",sourceVersionId);
+        }
+        assertSkillActive(sourceSkill);
+        assertNamespaceActive(sourceNamespace);
+        if (!(legacyAuth ? permissionChecker.canSubmitPromotion(sourceSkill,userId,userNamespaceRoles)
+                : permissionChecker.canSubmitPromotion(sourceSkill,userId,userNamespaceRoles,platformRoles))) {
+            throw new DomainForbiddenException("promotion.submit.no_permission");
+        }
 
         if (targetNamespace.getType() != NamespaceType.GLOBAL) {
             throw new DomainBadRequestException("promotion.target_not_global", targetNamespaceId);
@@ -165,6 +180,7 @@ public class PromotionService {
         PromotionRequest request = promotionRequestRepository.findById(promotionId)
                 .orElseThrow(() -> new DomainNotFoundException("promotion.not_found", promotionId));
 
+        mutationGuard.approval(request);
         if (request.getStatus() != ReviewTaskStatus.PENDING) {
             throw new DomainBadRequestException("promotion.not_pending", promotionId);
         }
@@ -194,47 +210,47 @@ public class PromotionService {
         PromotionRequest approvedRequest = promotionRequestRepository.findById(promotionId)
                 .orElseThrow(() -> new DomainNotFoundException("promotion.not_found", promotionId));
 
+        Skill currentSourceSkill = skillRepository.findById(approvedRequest.getSourceSkillId())
+                .orElseThrow(() -> new DomainNotFoundException("skill.not_found", approvedRequest.getSourceSkillId()));
         SkillVersion sourceVersion = skillVersionRepository.findById(approvedRequest.getSourceVersionId())
                 .orElseThrow(() -> new DomainNotFoundException("skill_version.not_found", approvedRequest.getSourceVersionId()));
 
-        if (!sourceVersion.getSkillId().equals(sourceSkill.getId())
+        if (!sourceVersion.getSkillId().equals(currentSourceSkill.getId())
                 || sourceVersion.getStatus() != SkillVersionStatus.PUBLISHED) {
             throw new DomainBadRequestException("promotion.version_not_published", sourceVersion.getId());
         }
-        assertSkillActive(sourceSkill);
-        Namespace sourceNamespace = namespaceRepository.findById(sourceSkill.getNamespaceId())
-                .orElseThrow(() -> new DomainNotFoundException("namespace.not_found", sourceSkill.getNamespaceId()));
+        assertSkillActive(currentSourceSkill);
+        Namespace sourceNamespace = namespaceRepository.findById(currentSourceSkill.getNamespaceId())
+                .orElseThrow(() -> new DomainNotFoundException("namespace.not_found", currentSourceSkill.getNamespaceId()));
         assertNamespaceActive(sourceNamespace);
 
         Skill targetSkill;
         if (approvedRequest.getRequestKind() == PromotionRequestKind.UPDATE) {
-            PromotionRequest initial = promotionRequestRepository.findActiveInitialBySourceSkillId(sourceSkill.getId())
-                    .orElseThrow(() -> new DomainBadRequestException("promotion.target_inactive", sourceSkill.getId()));
-            targetSkill = requireActiveTarget(initial, sourceSkill, approvedRequest.getTargetNamespaceId());
+            PromotionRequest initial = promotionRequestRepository.findActiveInitialBySourceSkillId(currentSourceSkill.getId())
+                    .orElseThrow(() -> new DomainBadRequestException("promotion.target_inactive", currentSourceSkill.getId()));
+            targetSkill = requireActiveTarget(initial, currentSourceSkill, approvedRequest.getTargetNamespaceId());
             if (!targetSkill.getId().equals(approvedRequest.getTargetSkillId())) {
-                throw new DomainBadRequestException("promotion.target_inactive", sourceSkill.getId());
+                throw new DomainBadRequestException("promotion.target_inactive", currentSourceSkill.getId());
             }
-            // Serialize approval with ordinary uploads that lock target Skill before publishing.
-            entityManager.lock(targetSkill, jakarta.persistence.LockModeType.PESSIMISTIC_WRITE);
             assertTargetVersionAvailable(targetSkill.getId(), sourceVersion.getVersion());
-            targetSkill.setDisplayName(sourceSkill.getDisplayName());
-            targetSkill.setSummary(sourceSkill.getSummary());
+            targetSkill.setDisplayName(currentSourceSkill.getDisplayName());
+            targetSkill.setSummary(currentSourceSkill.getSummary());
         } else {
-            if (promotionRequestRepository.findActiveInitialBySourceSkillId(sourceSkill.getId()).isPresent()) {
-                throw new DomainBadRequestException("promotion.already_promoted", sourceSkill.getId());
+            if (promotionRequestRepository.findActiveInitialBySourceSkillId(currentSourceSkill.getId()).isPresent()) {
+                throw new DomainBadRequestException("promotion.already_promoted", currentSourceSkill.getId());
             }
-            assertTargetSkillNotExists(approvedRequest, sourceSkill);
-            targetSkill = new Skill(approvedRequest.getTargetNamespaceId(), sourceSkill.getSlug(),
-                    sourceSkill.getOwnerId(), SkillVisibility.PUBLIC);
-            targetSkill.setDisplayName(sourceSkill.getDisplayName());
-            targetSkill.setSummary(sourceSkill.getSummary());
-            targetSkill.setSourceSkillId(sourceSkill.getId());
+            assertTargetSkillNotExists(approvedRequest, currentSourceSkill);
+            targetSkill = new Skill(approvedRequest.getTargetNamespaceId(), currentSourceSkill.getSlug(),
+                    currentSourceSkill.getOwnerId(), SkillVisibility.PUBLIC);
+            targetSkill.setDisplayName(currentSourceSkill.getDisplayName());
+            targetSkill.setSummary(currentSourceSkill.getSummary());
+            targetSkill.setSourceSkillId(currentSourceSkill.getId());
             targetSkill.setCreatedBy(reviewerId);
             targetSkill.setUpdatedBy(reviewerId);
             try {
                 targetSkill = skillRepository.save(targetSkill);
             } catch (DataIntegrityViolationException ex) {
-                throw duplicateTargetSkillConflict(sourceSkill.getSlug(), ex);
+                throw duplicateTargetSkillConflict(currentSourceSkill.getSlug(), ex);
             }
         }
 
@@ -347,6 +363,7 @@ public class PromotionService {
         PromotionRequest request = promotionRequestRepository.findById(promotionId)
                 .orElseThrow(() -> new DomainNotFoundException("promotion.not_found", promotionId));
 
+        mutationGuard.request(request);
         if (request.getStatus() != ReviewTaskStatus.PENDING) {
             throw new DomainBadRequestException("promotion.not_pending", promotionId);
         }

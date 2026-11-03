@@ -68,10 +68,8 @@ public class PromotionRevocationPortalAppService {
     @Transactional
     public PromotionRevocationResponse approve(Long requestId, String userId,
                                                String comment, AuditRequestContext context) {
-        revocationRepository.findById(requestId)
-                .ifPresent(pending -> searchIndexService.remove(pending.getTargetSkillId()));
         PromotionRevocationRequest request = revocationService.approve(requestId, userId,
-                platformRoles(userId), comment, clientIp(context), userAgent(context));
+                platformRoles(userId), comment, clientIp(context), userAgent(context),searchIndexService::remove);
         audit("PROMOTION_REVOCATION_APPROVE", request, userId, context);
         return PromotionRevocationResponse.from(request);
     }
@@ -88,10 +86,8 @@ public class PromotionRevocationPortalAppService {
     @Transactional
     public PromotionRevocationResponse revokeDirect(Long sourceSkillId, String userId,
                                                     String reason, AuditRequestContext context) {
-        promotionRepository.findActiveInitialBySourceSkillId(sourceSkillId)
-                .ifPresent(initial -> searchIndexService.remove(initial.getTargetSkillId()));
         PromotionRevocationRequest request = revocationService.revokeDirect(sourceSkillId, userId,
-                platformRoles(userId), reason, clientIp(context), userAgent(context));
+                platformRoles(userId), reason, clientIp(context), userAgent(context),searchIndexService::remove);
         audit("PROMOTION_REVOCATION_DIRECT", request, userId, context);
         return PromotionRevocationResponse.from(request);
     }

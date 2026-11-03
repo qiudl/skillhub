@@ -216,7 +216,7 @@ class ScanTaskConsumerLoggingTest {
 
     private static final class NoOpSecurityScanService extends SecurityScanService {
         private NoOpSecurityScanService() {
-            super(null, null, task -> {}, new ObjectMapper(), "upload", true);
+            super(null, null, task -> {}, new ObjectMapper(), "upload", true, null);
         }
 
         @Override

@@ -1,7 +1,8 @@
 package com.iflytek.skillhub.domain.skill.service;
 
 import com.iflytek.skillhub.domain.event.SkillPublishedEvent;
-import com.iflytek.skillhub.domain.namespace.NamespaceMemberRepository;
+import com.iflytek.skillhub.domain.namespace.NamespaceRepository;
+import jakarta.persistence.EntityManager;
 import com.iflytek.skillhub.domain.namespace.NamespaceRole;
 import com.iflytek.skillhub.domain.review.ReviewTask;
 import com.iflytek.skillhub.domain.review.ReviewTaskRepository;
@@ -37,23 +38,25 @@ public class SkillReviewSubmitService {
     private final SkillRepository skillRepository;
     private final SkillVersionRepository skillVersionRepository;
     private final ReviewTaskRepository reviewTaskRepository;
-    private final NamespaceMemberRepository namespaceMemberRepository;
+    private final SkillSubmissionGuard submissionGuard;
     private final ApplicationEventPublisher eventPublisher;
     private final Clock clock;
+    private final SlarkAssetAuthorization slark;
 
     public SkillReviewSubmitService(
             SkillRepository skillRepository,
             SkillVersionRepository skillVersionRepository,
             ReviewTaskRepository reviewTaskRepository,
-            NamespaceMemberRepository namespaceMemberRepository,
+            NamespaceRepository namespaceRepository,
             ApplicationEventPublisher eventPublisher,
-            Clock clock) {
+            Clock clock, SlarkAssetAuthorization slark, EntityManager entityManager) {
         this.skillRepository = skillRepository;
         this.skillVersionRepository = skillVersionRepository;
         this.reviewTaskRepository = reviewTaskRepository;
-        this.namespaceMemberRepository = namespaceMemberRepository;
+        this.submissionGuard = new SkillSubmissionGuard(namespaceRepository, reviewTaskRepository, entityManager);
         this.eventPublisher = eventPublisher;
         this.clock = clock;
+        this.slark = slark;
     }
 
     /**
@@ -76,7 +79,9 @@ public class SkillReviewSubmitService {
         SkillVersion version = skillVersionRepository.findById(versionId)
                 .orElseThrow(() -> new DomainBadRequestException("error.skill.version.notFound", versionId));
 
-        // Validate ownership
+        submissionGuard.lock(skill, version);
+
+        // Validate ownership against the refreshed candidate.
         assertCanManageLifecycle(skill, actorUserId, userNamespaceRoles);
 
         // Validate version status - support both UPLOADED (new) and DRAFT (legacy)
@@ -89,6 +94,8 @@ public class SkillReviewSubmitService {
         if (!version.getSkillId().equals(skillId)) {
             throw new DomainBadRequestException("error.skill.version.mismatch");
         }
+
+        slark.assertVisibility(skill.getNamespaceId(), targetVisibility);
 
         // Update version
         version.setStatus(SkillVersionStatus.PENDING_REVIEW);
@@ -127,8 +134,12 @@ public class SkillReviewSubmitService {
         SkillVersion version = skillVersionRepository.findById(versionId)
                 .orElseThrow(() -> new DomainBadRequestException("error.skill.version.notFound", versionId));
 
-        // Validate ownership
+        submissionGuard.lock(skill, version);
+
+        // Validate ownership against the refreshed candidate.
         assertCanManageLifecycle(skill, actorUserId, userNamespaceRoles, platformRoles);
+
+        slark.assertVisibility(skill.getNamespaceId(), skill.getVisibility());
 
         // Validate skill visibility is PRIVATE
         if (skill.getVisibility() != SkillVisibility.PRIVATE) {
@@ -167,6 +178,12 @@ public class SkillReviewSubmitService {
     private void assertCanManageLifecycle(Skill skill, String actorUserId,
                                           Map<Long, NamespaceRole> userNamespaceRoles,
                                           Set<String> platformRoles) {
+        var decision = slark.can(SlarkAssetAuthorization.Operation.SUBMIT,
+                skill.getNamespaceId(), skill.getId(), actorUserId);
+        if (decision.isPresent()) {
+            if (!decision.get()) throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+            return;
+        }
         NamespaceRole namespaceRole = userNamespaceRoles.get(skill.getNamespaceId());
         boolean canManage = skill.getOwnerId().equals(actorUserId)
                 || namespaceRole == NamespaceRole.ADMIN

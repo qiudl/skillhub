@@ -62,7 +62,28 @@ import org.springframework.test.context.ActiveProfiles;
 @ActiveProfiles("test")
 @Import(TestRedisConfig.class)
 @ExtendWith(OutputCaptureExtension.class)
+@org.testcontainers.junit.jupiter.Testcontainers
 class BuiltinSkillUpgradeConflictIntegrationTest {
+    @org.testcontainers.junit.jupiter.Container
+    static final org.testcontainers.containers.PostgreSQLContainer<?> PG =
+            new org.testcontainers.containers.PostgreSQLContainer<>("postgres:16-alpine");
+    @org.springframework.test.context.DynamicPropertySource
+    static void database(org.springframework.test.context.DynamicPropertyRegistry r) {
+        r.add("spring.datasource.url", PG::getJdbcUrl);
+        r.add("spring.datasource.username", PG::getUsername);
+        r.add("spring.datasource.password", PG::getPassword);
+        r.add("spring.datasource.driver-class-name", () -> "org.postgresql.Driver");
+        r.add("spring.jpa.database-platform", () -> "org.hibernate.dialect.PostgreSQLDialect");
+        r.add("spring.flyway.enabled", () -> true);
+        r.add("spring.jpa.hibernate.ddl-auto", () -> "validate");
+    }
+
+
+    // This native-only PostgreSQL fixture exercises actual publication row locks.
+    // Slark JDBC authorization and database failures are covered by the dedicated suites.
+    @MockBean
+    private com.iflytek.skillhub.domain.namespace.SlarkNamespaceBindingRepository slarkBindings;
+
 
     private static final String GLOBAL = "global";
     private static final String SYSTEM_PUBLISHER = "builtin-skill-publisher";
@@ -142,9 +163,10 @@ class BuiltinSkillUpgradeConflictIntegrationTest {
 
     @Test
     void upgradePreservesUserOwnedConflictAndPublishesRemainingBuiltIns(CapturedOutput output) throws Exception {
-        Namespace global = new Namespace(GLOBAL, "Global", "system");
-        global.setType(NamespaceType.GLOBAL);
-        global = namespaceRepository.save(global);
+        if (userAccountRepository.findById("system").isEmpty()) {
+            userAccountRepository.save(UserAccount.systemAccount("system", "System", null, null));
+        }
+        Namespace global = namespaceRepository.findBySlug(GLOBAL).orElseThrow();
 
         userAccountRepository.save(UserAccount.systemAccount(
                 SYSTEM_PUBLISHER,

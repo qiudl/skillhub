@@ -712,7 +712,7 @@ class ScanTaskConsumerTest {
 
         private StubSecurityScanService() {
             super(null, null, task -> {
-            }, new com.fasterxml.jackson.databind.ObjectMapper(), "local", true);
+            }, new com.fasterxml.jackson.databind.ObjectMapper(), "local", true, null);
         }
 
         @Override
@@ -815,6 +815,16 @@ class ScanTaskConsumerTest {
     private static final class InMemoryReviewTaskRepository implements ReviewTaskRepository {
         private ReviewTask savedTask;
         private ReviewTask deletedTask;
+
+        @Override
+        public java.util.List<ReviewTask> findBySkillIdOrderByIdAsc(Long skillId) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public java.util.List<ReviewTask> findBySkillVersionIdOrderByIdAsc(Long skillVersionId) {
+            throw unsupported();
+        }
 
         @Override
         public ReviewTask save(ReviewTask reviewTask) {

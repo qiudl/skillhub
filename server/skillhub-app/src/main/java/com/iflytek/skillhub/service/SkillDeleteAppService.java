@@ -112,7 +112,8 @@ public class SkillDeleteAppService {
                                              AuditRequestContext auditRequestContext,
                                              boolean enforcePortalOwnership,
                                              PlatformPrincipal principal) {
-        if (enforcePortalOwnership && !canDeleteFromPortal(skill, principal)) {
+        boolean bound = skillHardDeleteService.prepareForDeletion(skill, namespace, actorUserId);
+        if (enforcePortalOwnership && !bound && !canDeleteFromPortal(skill, principal)) {
             throw new DomainForbiddenException("error.forbidden");
         }
         searchIndexService.remove(skill.getId());

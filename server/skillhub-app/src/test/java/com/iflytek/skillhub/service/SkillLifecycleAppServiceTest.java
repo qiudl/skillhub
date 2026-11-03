@@ -80,7 +80,7 @@ class SkillLifecycleAppServiceTest {
     }
 
     @Test
-    void deleteVersion_locksAllSkillVersionsBeforeDelegatingLifecycleMutation() {
+    void deleteVersion_delegatesLockingToDomainBeforeLifecycleMutation() {
         Namespace namespace = new Namespace("global", "Global", "owner-1");
         ReflectionTestUtils.setField(namespace, "id", 7L);
         Skill skill = new Skill(7L, "demo-skill", "owner-1", SkillVisibility.PUBLIC);
@@ -99,8 +99,8 @@ class SkillLifecycleAppServiceTest {
                 "owner-1",
                 SkillSlugResolutionService.Preference.CURRENT_USER
         )).thenReturn(skill);
-        when(skillVersionRepository.findBySkillIdForUpdate(11L))
-                .thenReturn(java.util.List.of(version, retainedVersion));
+        when(skillVersionRepository.findBySkillIdAndVersion(11L, "1.0.0"))
+                .thenReturn(Optional.of(version));
 
         var response = service.deleteVersion(
                 "global",
@@ -113,7 +113,8 @@ class SkillLifecycleAppServiceTest {
 
         assertThat(response.versionId()).isEqualTo(13L);
         assertThat(response.action()).isEqualTo("DELETE_VERSION");
-        verify(skillVersionRepository).findBySkillIdForUpdate(11L);
+        verify(skillVersionRepository, org.mockito.Mockito.never()).findBySkillIdForUpdate(11L);
+        verify(skillVersionRepository).findBySkillIdAndVersion(11L, "1.0.0");
         verify(skillGovernanceService).deleteVersion(
                 skill,
                 version,
@@ -126,7 +127,7 @@ class SkillLifecycleAppServiceTest {
     }
 
     @Test
-    void yankVersion_locksAllSkillVersionsBeforeDelegatingLifecycleMutation() {
+    void yankVersion_defersCandidateLocksToDomainLifecycleMutation() {
         Namespace namespace = new Namespace("global", "Global", "owner-1");
         ReflectionTestUtils.setField(namespace, "id", 7L);
         Skill skill = new Skill(7L, "demo-skill", "owner-1", SkillVisibility.PUBLIC);
@@ -142,8 +143,8 @@ class SkillLifecycleAppServiceTest {
                 "owner-1",
                 SkillSlugResolutionService.Preference.CURRENT_USER
         )).thenReturn(skill);
-        when(skillVersionRepository.findBySkillIdForUpdate(11L))
-                .thenReturn(java.util.List.of(version));
+        when(skillVersionRepository.findBySkillIdAndVersion(11L, "1.0.0"))
+                .thenReturn(Optional.of(version));
         when(skillGovernanceService.yankVersion(
                 eq(skill),
                 eq(version),
@@ -166,7 +167,7 @@ class SkillLifecycleAppServiceTest {
 
         assertThat(response.versionId()).isEqualTo(13L);
         assertThat(response.action()).isEqualTo("YANK");
-        verify(skillVersionRepository).findBySkillIdForUpdate(11L);
+        verify(skillVersionRepository, org.mockito.Mockito.never()).findBySkillIdForUpdate(11L);
         verify(skillGovernanceService).yankVersion(
                 skill,
                 version,

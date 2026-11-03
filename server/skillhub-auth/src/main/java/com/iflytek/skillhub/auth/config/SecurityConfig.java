@@ -12,6 +12,8 @@ import com.iflytek.skillhub.auth.session.ExpiredPublicSessionFilter;
 import com.iflytek.skillhub.auth.session.CorruptSessionRemover;
 import com.iflytek.skillhub.auth.token.ApiTokenAuthenticationFilter;
 import com.iflytek.skillhub.auth.token.ApiTokenScopeFilter;
+import com.iflytek.skillhub.auth.slark.SlarkBridgeGuardFilter;
+import org.springframework.security.web.authentication.logout.LogoutFilter;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -115,7 +117,7 @@ public class SecurityConfig {
      * CSRF rules for browser traffic, and method-level authorization.
      */
     @Bean
-    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    public SecurityFilterChain filterChain(HttpSecurity http, ObjectProvider<SlarkBridgeGuardFilter> slarkGuard) throws Exception {
         var csrfHandler = new CsrfTokenRequestAttributeHandler();
         csrfHandler.setCsrfRequestAttributeName(null);
         RequestMatcher csrfIgnoreMatcher = request -> {
@@ -188,6 +190,7 @@ public class SecurityConfig {
             http.addFilterBefore(mockAuthFilter, AnonymousAuthenticationFilter.class);
         }
 
+        slarkGuard.ifAvailable(filter -> http.addFilterBefore(filter, LogoutFilter.class));
         return http.build();
     }
 

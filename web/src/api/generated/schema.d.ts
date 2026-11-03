@@ -10664,6 +10664,7 @@ export interface operations {
             query: {
                 visibility: string;
                 confirmWarnings?: boolean;
+                skillId?: number;
             };
             header?: never;
             path: {
@@ -10696,6 +10697,7 @@ export interface operations {
             query: {
                 visibility: string;
                 confirmWarnings?: boolean;
+                skillId?: number;
             };
             header?: never;
             path: {

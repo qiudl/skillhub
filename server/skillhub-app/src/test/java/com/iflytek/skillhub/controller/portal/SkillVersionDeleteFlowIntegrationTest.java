@@ -9,6 +9,13 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.iflytek.skillhub.domain.user.UserAccount;
+import com.iflytek.skillhub.domain.user.UserAccountRepository;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 import com.iflytek.skillhub.TestRedisConfig;
 import com.iflytek.skillhub.auth.device.DeviceAuthService;
 import com.iflytek.skillhub.auth.rbac.PlatformPrincipal;
@@ -40,11 +47,28 @@ import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 
+@Testcontainers
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
 @Import(TestRedisConfig.class)
 class SkillVersionDeleteFlowIntegrationTest {
+    // Deletion now exercises real PostgreSQL row locks and the released Flyway constraints.
+    @Container
+    static final PostgreSQLContainer<?> PG =
+            new PostgreSQLContainer<>("postgres:16-alpine");
+    @DynamicPropertySource
+    static void database(DynamicPropertyRegistry r) {
+        r.add("spring.datasource.url", PG::getJdbcUrl);
+        r.add("spring.datasource.username", PG::getUsername);
+        r.add("spring.datasource.password", PG::getPassword);
+        r.add("spring.datasource.driver-class-name", () -> "org.postgresql.Driver");
+        r.add("spring.jpa.database-platform", () -> "org.hibernate.dialect.PostgreSQLDialect");
+        r.add("spring.flyway.enabled", () -> true);
+        r.add("spring.jpa.hibernate.ddl-auto", () -> "validate");
+    }
+    @Autowired private UserAccountRepository users;
+
 
     @Autowired
     private MockMvc mockMvc;
@@ -73,6 +97,7 @@ class SkillVersionDeleteFlowIntegrationTest {
     @Test
     void deleteRejectedVersion_removesOnlyItsReviewHistory() throws Exception {
         String ownerId = "owner-1";
+        users.save(new UserAccount(ownerId, "Owner", null, null));
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         Namespace namespace = namespaceRepository.save(
                 new Namespace("version-delete-" + suffix, "Version Delete " + suffix, ownerId)

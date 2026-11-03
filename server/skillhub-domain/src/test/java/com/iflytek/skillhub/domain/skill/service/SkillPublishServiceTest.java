@@ -83,11 +83,15 @@ class SkillPublishServiceTest {
     @Mock
     private SkillStorageDeletionCompensationService compensationService;
 
+    @Mock
+    private SlarkAssetAuthorization slarkAssetAuthorization;
+
+    @Mock private jakarta.persistence.EntityManager entityManager;
     private SkillPublishService service;
     private ObjectMapper objectMapper;
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws Exception {
         objectMapper = new ObjectMapper();
         service = new SkillPublishService(
                 namespaceRepository,
@@ -104,8 +108,11 @@ class SkillPublishServiceTest {
                 securityScanService,
                 compensationService,
                 eventPublisher,
-                CLOCK
+                CLOCK, slarkAssetAuthorization
         );
+        var persistenceField = SkillPublishService.class.getDeclaredField("entityManager");
+        persistenceField.setAccessible(true);
+        persistenceField.set(service, entityManager);
         lenient().when(securityScanService.isEnabled()).thenReturn(true);
         lenient().when(skillVersionRepository.findBySkillIdAndStatus(anyLong(), eq(SkillVersionStatus.PENDING_REVIEW)))
                 .thenReturn(List.of());
@@ -165,6 +172,8 @@ class SkillPublishServiceTest {
 
         // Assert
         assertNotNull(result);
+        verify(slarkAssetAuthorization, times(2)).can(SlarkAssetAuthorization.Operation.CREATE, 1L, null, publisherId);
+        verify(slarkAssetAuthorization, never()).initializeCreator(any(), any());
         assertEquals(1L, result.skillId());
         assertEquals("test-skill", result.slug());
         assertEquals("1.0.0", result.version().getVersion());
@@ -1108,6 +1117,9 @@ class SkillPublishServiceTest {
         SkillVersion existingTarget = new SkillVersion(skill.getId(), "1.2.4", publisherId);
         setId(existingTarget, 22L);
 
+        Namespace namespace = new Namespace("global", "Global", "owner");
+        setId(namespace, 1L);
+        when(namespaceRepository.findById(1L)).thenReturn(Optional.of(namespace));
         when(skillRepository.findById(skill.getId())).thenReturn(Optional.of(skill));
         when(skillVersionRepository.findBySkillIdAndVersion(skill.getId(), "1.2.3")).thenReturn(Optional.of(sourceVersion));
         when(skillVersionRepository.findBySkillIdAndVersion(skill.getId(), "1.2.4")).thenReturn(Optional.of(existingTarget));
@@ -1396,6 +1408,11 @@ class SkillPublishServiceTest {
 
         assertNotNull(result);
         assertEquals("test-skill", result.slug());
+        InOrder order = inOrder(skillRepository, slarkAssetAuthorization, skillVersionRepository);
+        order.verify(skillRepository).save(any(Skill.class));
+        order.verify(skillRepository).flush();
+        order.verify(slarkAssetAuthorization).initializeCreator(newSkill, publisherId);
+        order.verify(skillVersionRepository).save(any(SkillVersion.class));
     }
 
     @Test
@@ -1419,7 +1436,8 @@ class SkillPublishServiceTest {
         SkillVersion pendingV1 = new SkillVersion(1L, "1.0.0", publisherId);
         pendingV1.setStatus(SkillVersionStatus.PENDING_REVIEW);
         setId(pendingV1, 5L);
-        ReviewTask pendingTask = new ReviewTask(5L, 1L, publisherId);
+        ReviewTask pendingTask = new ReviewTask(5L, 1L, 1L, "1.0.0", publisherId);
+        setId(pendingTask, 7L);
 
         when(namespaceRepository.findBySlug(namespaceSlug)).thenReturn(Optional.of(namespace));
         when(namespaceMemberRepository.findByNamespaceIdAndUserId(any(), eq(publisherId))).thenReturn(Optional.of(member));
@@ -1429,8 +1447,9 @@ class SkillPublishServiceTest {
         when(skillRepository.findByNamespaceIdAndSlug(any(), eq("test-skill"))).thenReturn(List.of(skill));
         when(skillRepository.findByNamespaceIdAndSlugAndOwnerId(any(), eq("test-skill"), eq(publisherId))).thenReturn(Optional.of(skill));
         when(skillVersionRepository.findBySkillIdAndStatus(1L, SkillVersionStatus.PENDING_REVIEW)).thenReturn(List.of(pendingV1));
-        when(reviewTaskRepository.findBySkillVersionIdAndStatus(5L, com.iflytek.skillhub.domain.review.ReviewTaskStatus.PENDING))
-                .thenReturn(Optional.of(pendingTask));
+        when(reviewTaskRepository.findBySkillIdOrderByIdAsc(1L)).thenReturn(List.of(pendingTask));
+        when(skillVersionRepository.findBySkillId(1L)).thenReturn(List.of(pendingV1));
+        when(entityManager.contains(pendingTask)).thenReturn(true);
         when(skillVersionRepository.findBySkillIdAndVersion(any(), eq("2.0.0"))).thenReturn(Optional.empty());
         when(skillVersionRepository.save(any(SkillVersion.class))).thenAnswer(invocation -> {
             SkillVersion saved = invocation.getArgument(0);

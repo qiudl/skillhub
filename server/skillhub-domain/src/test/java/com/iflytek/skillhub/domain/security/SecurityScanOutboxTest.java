@@ -34,7 +34,7 @@ class SecurityScanOutboxTest {
         id.set(version, 42L);
         given(versionRepository.findById(42L)).willReturn(Optional.of(version));
         SecurityScanService service = new SecurityScanService(auditRepository, versionRepository, producer,
-                new ObjectMapper(), "upload", true, outboxRepository);
+                new ObjectMapper(), "upload", true, outboxRepository, org.mockito.Mockito.mock(jakarta.persistence.EntityManager.class));
 
         service.triggerScan(42L, List.of(new PackageEntry("SKILL.md", new byte[0], 0, "text/markdown")), "publisher");
 
@@ -49,7 +49,7 @@ class SecurityScanOutboxTest {
     void softDeleteRemovesPendingOutboxEvenWhenNoActiveAuditExists() {
         given(auditRepository.findAllActiveBySkillVersionId(42L)).willReturn(List.of());
         SecurityScanService service = new SecurityScanService(auditRepository, versionRepository, producer,
-                new ObjectMapper(), "upload", true, outboxRepository);
+                new ObjectMapper(), "upload", true, outboxRepository, org.mockito.Mockito.mock(jakarta.persistence.EntityManager.class));
 
         service.softDeleteByVersionId(42L);
 

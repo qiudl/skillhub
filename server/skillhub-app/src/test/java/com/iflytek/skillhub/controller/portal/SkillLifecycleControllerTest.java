@@ -138,15 +138,15 @@ class SkillLifecycleControllerTest {
         setNamespaceId(namespace, 1L);
         Skill skill = new Skill(1L, "demo-skill", "owner", SkillVisibility.PUBLIC);
         setSkillId(skill, 1L);
-        SkillVersion version = new SkillVersion(2L, "1.0.0", "owner");
+        SkillVersion version = new SkillVersion(1L, "1.0.0", "owner");
         setSkillVersionId(version, 2L);
         version.setStatus(SkillVersionStatus.DRAFT);
 
         given(namespaceRepository.findBySlug("global")).willReturn(java.util.Optional.of(namespace));
         given(skillSlugResolutionService.resolve(1L, "demo-skill", "usr_1", SkillSlugResolutionService.Preference.CURRENT_USER))
                 .willReturn(skill);
-        given(skillVersionRepository.findBySkillIdForUpdate(1L))
-                .willReturn(java.util.List.of(version));
+        given(skillVersionRepository.findBySkillIdAndVersion(1L, "1.0.0"))
+                .willReturn(java.util.Optional.of(version));
 
         mockMvc.perform(delete("/api/web/skills/global/demo-skill/versions/1.0.0")
                         .requestAttr("userId", "usr_1")
@@ -177,7 +177,7 @@ class SkillLifecycleControllerTest {
         given(namespaceRepository.findBySlug("global")).willReturn(java.util.Optional.of(namespace));
         given(skillSlugResolutionService.resolve(1L, "demo-skill", "usr_1", SkillSlugResolutionService.Preference.CURRENT_USER))
                 .willReturn(skill);
-        given(skillVersionRepository.findBySkillIdForUpdate(1L)).willReturn(java.util.List.of(version));
+        given(skillVersionRepository.findBySkillIdAndVersion(1L,"1.2.3")).willReturn(java.util.Optional.of(version));
         given(skillGovernanceService.yankVersion(
                 eq(skill), eq(version), eq("usr_1"), anyMap(), nullable(String.class), nullable(String.class), eq("broken")))
                 .willReturn(yanked);
@@ -216,7 +216,7 @@ class SkillLifecycleControllerTest {
         given(namespaceRepository.findBySlug("global")).willReturn(java.util.Optional.of(namespace));
         given(skillSlugResolutionService.resolve(1L, "demo-skill", "usr_1", SkillSlugResolutionService.Preference.CURRENT_USER))
                 .willReturn(skill);
-        given(skillVersionRepository.findBySkillIdForUpdate(1L)).willReturn(java.util.List.of(version));
+        given(skillVersionRepository.findBySkillIdAndVersion(1L,"1.2.3")).willReturn(java.util.Optional.of(version));
         given(skillGovernanceService.yankVersion(
                 eq(skill), eq(version), eq("usr_1"), anyMap(), nullable(String.class), nullable(String.class), isNull()))
                 .willReturn(yanked);

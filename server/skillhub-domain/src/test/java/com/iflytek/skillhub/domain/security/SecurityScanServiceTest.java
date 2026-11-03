@@ -1,6 +1,7 @@
 package com.iflytek.skillhub.domain.security;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.EntityManager;
 import com.iflytek.skillhub.domain.skill.SkillVersion;
 import com.iflytek.skillhub.domain.skill.SkillVersionRepository;
 import com.iflytek.skillhub.domain.skill.SkillVersionStatus;
@@ -40,6 +41,8 @@ class SecurityScanServiceTest {
     @Mock
     private ScanTaskProducer scanTaskProducer;
 
+    @Mock private EntityManager entityManager;
+
     private SecurityScanService service;
 
     @BeforeEach
@@ -50,7 +53,7 @@ class SecurityScanServiceTest {
                 scanTaskProducer,
                 new ObjectMapper(),
                 "local",
-                true
+                true, entityManager
         );
     }
 
@@ -113,7 +116,7 @@ class SecurityScanServiceTest {
                 scanTaskProducer,
                 new ObjectMapper(),
                 "upload",
-                true
+                true, entityManager
         );
         SkillVersion version = new SkillVersion(8L, "1.0.0", "publisher-1");
         setId(version, 42L);
@@ -147,11 +150,12 @@ class SecurityScanServiceTest {
                 new ObjectMapper(),
                 "local",
                 true,
-                outboxRepository
+                outboxRepository, entityManager
         );
         SkillVersion version = new SkillVersion(8L, "1.0.0", "owner-1");
         setId(version, 42L);
         version.setStatus(SkillVersionStatus.SCAN_FAILED);
+        given(skillVersionRepository.findByIdForUpdate(42L)).willReturn(Optional.of(version));
 
         ScanTask task = service.retryStoredBundleScan(version, "packages/8/42/bundle.zip", "owner-1");
 
@@ -173,6 +177,7 @@ class SecurityScanServiceTest {
         SkillVersion version = new SkillVersion(8L, "1.0.0", "owner-1");
         setId(version, 42L);
         version.setStatus(SkillVersionStatus.SCANNING);
+        given(skillVersionRepository.findByIdForUpdate(42L)).willReturn(Optional.of(version));
 
         assertThatThrownBy(() -> service.retryStoredBundleScan(version, "bundle.zip", "owner-1"))
                 .isInstanceOf(IllegalStateException.class)
@@ -255,7 +260,7 @@ class SecurityScanServiceTest {
                 scanTaskProducer,
                 new ObjectMapper(),
                 "upload",
-                true
+                true, entityManager
         );
         SkillVersion version = new SkillVersion(8L, "1.0.0", "publisher-1");
         setId(version, 42L);
@@ -282,7 +287,7 @@ class SecurityScanServiceTest {
         given(auditRepository.findByTaskId("task-current")).willReturn(Optional.of(audit));
         given(auditRepository.findLatestActiveByVersionIdAndScannerType(42L, ScannerType.SKILL_SCANNER))
                 .willReturn(Optional.of(audit));
-        given(skillVersionRepository.findById(42L)).willReturn(Optional.of(version));
+        given(skillVersionRepository.findByIdForUpdate(42L)).willReturn(Optional.of(version));
 
         SecurityScanResponse response = new SecurityScanResponse(
                 "scan-123",
@@ -347,7 +352,7 @@ class SecurityScanServiceTest {
         given(auditRepository.findByTaskId("task-current")).willReturn(Optional.of(audit));
         given(auditRepository.findLatestActiveByVersionIdAndScannerType(42L, ScannerType.SKILL_SCANNER))
                 .willReturn(Optional.of(audit));
-        given(skillVersionRepository.findById(42L)).willReturn(Optional.of(version));
+        given(skillVersionRepository.findByIdForUpdate(42L)).willReturn(Optional.of(version));
 
         service.processScanFailure("task-current", 42L, ScannerType.SKILL_SCANNER, "scanner unavailable");
 
@@ -365,6 +370,7 @@ class SecurityScanServiceTest {
         SkillVersion version = new SkillVersion(8L, "1.0.0", "publisher-1");
         setId(version, 42L);
         version.setStatus(SkillVersionStatus.SCANNING);
+        given(skillVersionRepository.findByIdForUpdate(42L)).willReturn(Optional.of(version));
         given(auditRepository.findByTaskId("task-stale")).willReturn(Optional.of(stale));
         given(auditRepository.findLatestActiveByVersionIdAndScannerType(42L, ScannerType.SKILL_SCANNER))
                 .willReturn(Optional.of(current));
@@ -386,7 +392,7 @@ class SecurityScanServiceTest {
         given(auditRepository.findByTaskId("task-published")).willReturn(Optional.of(audit));
         given(auditRepository.findLatestActiveByVersionIdAndScannerType(42L, ScannerType.SKILL_SCANNER))
                 .willReturn(Optional.of(audit));
-        given(skillVersionRepository.findById(42L)).willReturn(Optional.of(version));
+        given(skillVersionRepository.findByIdForUpdate(42L)).willReturn(Optional.of(version));
 
         SecurityScanResponse response = new SecurityScanResponse(
                 "scan-456",
@@ -402,7 +408,7 @@ class SecurityScanServiceTest {
         assertThat(audit.getVerdict()).isEqualTo(SecurityVerdict.SAFE);
         assertThat(audit.getIsSafe()).isTrue();
         assertThat(version.getStatus()).isEqualTo(SkillVersionStatus.PUBLISHED);
-        verify(skillVersionRepository).save(version);
+        verify(skillVersionRepository, never()).save(version);
     }
 
     @Test
@@ -414,7 +420,7 @@ class SecurityScanServiceTest {
         given(auditRepository.findByTaskId("task-masked")).willReturn(Optional.of(audit));
         given(auditRepository.findLatestActiveByVersionIdAndScannerType(42L, ScannerType.SKILL_SCANNER))
                 .willReturn(Optional.of(audit));
-        given(skillVersionRepository.findById(42L)).willReturn(Optional.of(version));
+        given(skillVersionRepository.findByIdForUpdate(42L)).willReturn(Optional.of(version));
 
         String canary = "ghp_012345678901234567890123456789012345";
         SecurityFinding maskedFinding = new SecurityFinding(
@@ -438,7 +444,7 @@ class SecurityScanServiceTest {
         given(auditRepository.findByTaskId("task-stale")).willReturn(Optional.of(stale));
         given(auditRepository.findLatestActiveByVersionIdAndScannerType(42L, ScannerType.SKILL_SCANNER))
                 .willReturn(Optional.of(current));
-        given(skillVersionRepository.findById(42L)).willReturn(Optional.of(version));
+        given(skillVersionRepository.findByIdForUpdate(42L)).willReturn(Optional.of(version));
 
         service.processScanResult(
                 "task-stale",

@@ -52,11 +52,29 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+@org.testcontainers.junit.jupiter.Testcontainers
 @SpringBootTest(classes = SkillhubApplication.class)
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
 @Import(TestRedisConfig.class)
+@org.springframework.test.annotation.DirtiesContext(classMode=org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 class PromotionApprovalFlowIntegrationTest {
+    @org.testcontainers.junit.jupiter.Container
+    static final org.testcontainers.containers.PostgreSQLContainer<?> PG = new org.testcontainers.containers.PostgreSQLContainer<>("postgres:16-alpine");
+    @org.springframework.test.context.DynamicPropertySource
+    static void database(org.springframework.test.context.DynamicPropertyRegistry r) {
+        r.add("spring.datasource.url",PG::getJdbcUrl);r.add("spring.datasource.username",PG::getUsername);
+        r.add("spring.datasource.password",PG::getPassword);r.add("spring.datasource.driver-class-name",()->"org.postgresql.Driver");
+        r.add("spring.jpa.database-platform",()->"org.hibernate.dialect.PostgreSQLDialect");
+        r.add("spring.flyway.enabled",()->true);r.add("spring.jpa.hibernate.ddl-auto",()->"validate");
+    }
+
+
+    // Native promotion integration now exercises PostgreSQL row locks and Flyway constraints.
+    // Slark JDBC authorization and database failures are covered by the dedicated suites.
+    @MockBean
+    private com.iflytek.skillhub.domain.namespace.SlarkNamespaceBindingRepository slarkBindings;
+
 
     private static final String SUBMITTER_ID = "promotion-owner";
     private static final String REVIEWER_ID = "docker-admin";

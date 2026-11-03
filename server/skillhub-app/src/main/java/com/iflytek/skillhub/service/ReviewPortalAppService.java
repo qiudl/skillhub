@@ -137,7 +137,7 @@ public class ReviewPortalAppService {
                     reviewTaskId, suiteContext(userId, userNsRoles, auditContext));
             return;
         }
-        reviewService.withdrawReview(task.getSkillVersionId(), userId);
+        reviewService.withdrawReviewTask(reviewTaskId, userId);
         recordAudit(
                 "REVIEW_WITHDRAW",
                 userId,

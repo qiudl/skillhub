@@ -5,6 +5,7 @@ import com.iflytek.skillhub.domain.namespace.Namespace;
 import com.iflytek.skillhub.domain.namespace.NamespaceRepository;
 import com.iflytek.skillhub.domain.namespace.NamespaceRole;
 import com.iflytek.skillhub.domain.namespace.NamespaceType;
+import com.iflytek.skillhub.domain.namespace.SlarkNamespaceBindingRepository;
 import com.iflytek.skillhub.domain.shared.exception.DomainBadRequestException;
 import com.iflytek.skillhub.domain.shared.exception.DomainForbiddenException;
 import com.iflytek.skillhub.domain.skill.*;
@@ -52,6 +53,7 @@ class SkillDownloadServiceTest {
     private VisibilityChecker visibilityChecker;
     @Mock
     private ApplicationEventPublisher eventPublisher;
+    @Mock private SlarkNamespaceBindingRepository slarkBindings;
 
     private SkillDownloadService service;
     private SkillSlugResolutionService skillSlugResolutionService;
@@ -69,7 +71,8 @@ class SkillDownloadServiceTest {
                 objectStorageService,
                 visibilityChecker,
                 eventPublisher,
-                skillSlugResolutionService
+                skillSlugResolutionService,
+                slarkBindings
         );
     }
 

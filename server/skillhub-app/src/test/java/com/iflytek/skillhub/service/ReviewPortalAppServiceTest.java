@@ -102,7 +102,7 @@ class ReviewPortalAppServiceTest {
         verify(suiteLifecycleService).withdrawReview(
                 org.mockito.ArgumentMatchers.eq(92L),
                 org.mockito.ArgumentMatchers.any(SkillSuiteActionContext.class));
-        verify(reviewService, never()).withdrawReview(
+        verify(reviewService, never()).withdrawReviewTask(
                 org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyString());
     }
 

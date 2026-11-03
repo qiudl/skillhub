@@ -72,6 +72,9 @@ class SkillYankLockingTest {
     @Autowired
     private SkillVersionJpaRepository skillVersionRepository;
 
+    @Autowired private SkillRepository skillRepository;
+    @Autowired private com.iflytek.skillhub.domain.namespace.NamespaceRepository namespaceRepository;
+
     @Autowired
     private PlatformTransactionManager transactionManager;
 
@@ -116,10 +119,8 @@ class SkillYankLockingTest {
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     void concurrentAdminYanksRecordOneAuditAndOneEvent() throws Exception {
         Fixture fixture = persistPublishedVersion();
-        SkillRepository skillRepository = mock(SkillRepository.class);
         AuditLogService auditLogService = mock(AuditLogService.class);
         ApplicationEventPublisher eventPublisher = mock(ApplicationEventPublisher.class);
-        when(skillRepository.findById(fixture.skillId())).thenReturn(java.util.Optional.empty());
         SkillGovernanceService service = new SkillGovernanceService(
                 skillRepository,
                 skillVersionRepository,
@@ -130,7 +131,9 @@ class SkillYankLockingTest {
                 eventPublisher,
                 mock(SecurityScanService.class),
                 mock(SkillStorageDeletionCompensationService.class),
-                Clock.systemUTC());
+                Clock.systemUTC(), namespaceRepository,
+                mock(com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization.class));
+        org.springframework.test.util.ReflectionTestUtils.setField(service,"entityManager",entityManager);
         CountDownLatch firstAudited = new CountDownLatch(1);
         CountDownLatch secondReady = new CountDownLatch(1);
         CountDownLatch releaseFirst = new CountDownLatch(1);

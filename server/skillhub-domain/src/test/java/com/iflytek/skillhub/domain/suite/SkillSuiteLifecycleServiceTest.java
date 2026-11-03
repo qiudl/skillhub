@@ -54,7 +54,7 @@ class SkillSuiteLifecycleServiceTest {
     void setUp() throws Exception {
         Clock clock = Clock.fixed(Instant.parse("2026-09-07T08:00:00Z"), ZoneOffset.UTC);
         service = new SkillSuiteLifecycleService(
-                suiteRepository, versionRepository, reviewTaskRepository, new ReviewPermissionChecker(), namespaceRepository,
+                suiteRepository, versionRepository, reviewTaskRepository, new ReviewPermissionChecker(org.mockito.Mockito.mock(com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization.class)), namespaceRepository,
                 publicationValidator, auditLogService, clock, true);
         suite = new SkillSuite(1L, "writers", "Writers", "author");
         version = new SkillSuiteVersion(10L, "1.0.0", SkillVisibility.PRIVATE, "author");
@@ -209,7 +209,7 @@ class SkillSuiteLifecycleServiceTest {
     @Test
     void rolloutGateRejectsTypedReviewWritesBeforeLoadingTheSuite() {
         SkillSuiteLifecycleService disabled = new SkillSuiteLifecycleService(
-                suiteRepository, versionRepository, reviewTaskRepository, new ReviewPermissionChecker(),
+                suiteRepository, versionRepository, reviewTaskRepository, new ReviewPermissionChecker(org.mockito.Mockito.mock(com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization.class)),
                 namespaceRepository, publicationValidator, auditLogService,
                 Clock.systemUTC(), false);
 
@@ -223,7 +223,7 @@ class SkillSuiteLifecycleServiceTest {
     void rolloutGateOmitsSubmitFromAllowedActions() {
         version.setVisibility(SkillVisibility.PUBLIC);
         SkillSuiteLifecycleService disabled = new SkillSuiteLifecycleService(
-                suiteRepository, versionRepository, reviewTaskRepository, new ReviewPermissionChecker(),
+                suiteRepository, versionRepository, reviewTaskRepository, new ReviewPermissionChecker(org.mockito.Mockito.mock(com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization.class)),
                 namespaceRepository, publicationValidator, auditLogService,
                 Clock.systemUTC(), false);
 

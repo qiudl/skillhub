@@ -99,7 +99,7 @@ public class SkillLifecycleAppService {
                                                         Map<Long, NamespaceRole> userNamespaceRoles,
                                                         AuditRequestContext auditContext) {
         Skill skill = findSkill(namespace, slug, userId);
-        SkillVersion skillVersion = findVersionForUpdate(skill.getId(), version);
+        SkillVersion skillVersion = findVersion(skill.getId(), version);
         skillGovernanceService.deleteVersion(
                 skill,
                 skillVersion,
@@ -121,7 +121,7 @@ public class SkillLifecycleAppService {
                                                       Map<Long, NamespaceRole> userNamespaceRoles,
                                                       AuditRequestContext auditContext) {
         Skill skill = findSkill(namespace, slug, userId);
-        SkillVersion skillVersion = findVersionForUpdate(skill.getId(), version);
+        SkillVersion skillVersion = findVersion(skill.getId(), version);
         SkillVersion yanked = skillGovernanceService.yankVersion(
                 skill,
                 skillVersion,
@@ -280,13 +280,6 @@ public class SkillLifecycleAppService {
 
     private SkillVersion findVersion(Long skillId, String version) {
         return skillVersionRepository.findBySkillIdAndVersion(skillId, version)
-                .orElseThrow(() -> new DomainBadRequestException("error.skill.version.notFound", version));
-    }
-
-    private SkillVersion findVersionForUpdate(Long skillId, String version) {
-        return skillVersionRepository.findBySkillIdForUpdate(skillId).stream()
-                .filter(candidate -> candidate.getVersion().equals(version))
-                .findFirst()
                 .orElseThrow(() -> new DomainBadRequestException("error.skill.version.notFound", version));
     }
 

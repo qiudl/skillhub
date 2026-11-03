@@ -15,10 +15,10 @@ import org.springframework.stereotype.Repository;
 /**
  * JPA-backed repository for skill version history and status-oriented version queries.
  *
- * <p>The deletion lock uses explicit {@code FOR UPDATE} SQL because Hibernate's PostgreSQL dialect
- * emits {@code FOR NO KEY UPDATE}, which H2's PostgreSQL compatibility mode cannot execute. It
- * locks every version in stable ID order so concurrent deletions cannot both remove the last
- * versions of one skill.
+ * <p>The explicit {@code FOR UPDATE} queries also work in H2 PostgreSQL compatibility mode,
+ * unlike Hibernate's {@code FOR NO KEY UPDATE}. The all-version lock remains available for yank
+ * orchestration. Version deletion locks its review history and candidate before the asset row,
+ * where it serializes the remaining-version check without reversing review lock order.
  */
 @Repository
 public interface SkillVersionJpaRepository extends JpaRepository<SkillVersion, Long>, SkillVersionRepository {

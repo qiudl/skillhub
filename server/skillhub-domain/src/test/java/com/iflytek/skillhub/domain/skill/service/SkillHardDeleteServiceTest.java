@@ -72,6 +72,9 @@ class SkillHardDeleteServiceTest {
     @Mock
     private AuditLogService auditLogService;
 
+    @Mock private com.iflytek.skillhub.domain.namespace.NamespaceRepository namespaces;
+    @Mock private com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization slark;
+    @Mock private jakarta.persistence.EntityManager entityManager;
     private SkillHardDeleteService service;
 
     @AfterEach
@@ -98,8 +101,15 @@ class SkillHardDeleteServiceTest {
                 compensationService,
                 securityScanService,
                 auditLogService,
-                new ObjectMapper()
+                new ObjectMapper(), namespaces, slark
         );
+        setField(service,"entityManager",entityManager);
+        org.mockito.Mockito.lenient().when(namespaces.findById(org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(i -> {
+                    var ns = new com.iflytek.skillhub.domain.namespace.Namespace("global", "Global", "owner");
+                    setField(ns,"id",i.getArgument(0));
+                    return java.util.Optional.of(ns);
+                });
     }
 
     @Test

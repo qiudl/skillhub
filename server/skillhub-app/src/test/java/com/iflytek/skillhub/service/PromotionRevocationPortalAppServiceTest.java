@@ -56,34 +56,21 @@ class PromotionRevocationPortalAppServiceTest {
         PromotionRevocationRequest request = new PromotionRevocationRequest(
                 4L, 10L, 30L, 2L, 1L, "foo", "owner-1", "withdraw");
         when(rbacService.getUserRoleCodes("admin-1")).thenReturn(Set.of("SKILL_ADMIN"));
-        when(repository.findById(5L)).thenReturn(Optional.of(request));
-        when(domain.approve(5L, "admin-1", Set.of("SKILL_ADMIN"), "ok", null, null))
-                .thenReturn(request);
-
-        service.approve(5L, "admin-1", "ok", null);
-
-        InOrder order = inOrder(domain, searchIndexService);
-        order.verify(searchIndexService).remove(30L);
-        order.verify(domain).approve(5L, "admin-1", Set.of("SKILL_ADMIN"), "ok", null, null);
+        when(domain.approve(org.mockito.ArgumentMatchers.eq(5L), org.mockito.ArgumentMatchers.eq("admin-1"), org.mockito.ArgumentMatchers.eq(Set.of("SKILL_ADMIN")), org.mockito.ArgumentMatchers.eq("ok"), org.mockito.ArgumentMatchers.isNull(), org.mockito.ArgumentMatchers.isNull(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(i->{java.util.function.Consumer<Long> callback=i.getArgument(6);callback.accept(30L);return request;});
+        service.approve(5L,"admin-1","ok",null);
+        verify(searchIndexService).remove(30L);
     }
 
     @Test
-    void directRevocationRemovesSearchDocumentBeforeDeletingTarget() {
-        PromotionRequest promotion = new PromotionRequest(10L, 20L, 1L, "owner-1");
-        promotion.setTargetSkillId(30L);
+    void directRevocationUsesDomainChosenTargetForIndexCleanup() {
         PromotionRevocationRequest request = new PromotionRevocationRequest(
                 4L, 10L, 30L, 2L, 1L, "foo", "admin-1", "withdraw");
-        when(promotionRepository.findActiveInitialBySourceSkillId(10L))
-                .thenReturn(Optional.of(promotion));
         when(rbacService.getUserRoleCodes("admin-1")).thenReturn(Set.of("SKILL_ADMIN"));
-        when(domain.revokeDirect(10L, "admin-1", Set.of("SKILL_ADMIN"), "withdraw", null, null))
-                .thenReturn(request);
-
-        service.revokeDirect(10L, "admin-1", "withdraw", null);
-
-        InOrder order = inOrder(searchIndexService, domain);
-        order.verify(searchIndexService).remove(30L);
-        order.verify(domain).revokeDirect(10L, "admin-1", Set.of("SKILL_ADMIN"), "withdraw", null, null);
+        when(domain.revokeDirect(org.mockito.ArgumentMatchers.eq(10L), org.mockito.ArgumentMatchers.eq("admin-1"), org.mockito.ArgumentMatchers.eq(Set.of("SKILL_ADMIN")), org.mockito.ArgumentMatchers.eq("withdraw"), org.mockito.ArgumentMatchers.isNull(), org.mockito.ArgumentMatchers.isNull(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(i->{java.util.function.Consumer<Long> callback=i.getArgument(6);callback.accept(30L);return request;});
+        service.revokeDirect(10L,"admin-1","withdraw",null);
+        verify(searchIndexService).remove(30L);
     }
 
     @Test

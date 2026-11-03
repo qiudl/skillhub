@@ -32,7 +32,7 @@ public interface SecurityAuditJpaRepository extends JpaRepository<SecurityAudit,
             WHERE sa.skillVersionId = :versionId
               AND sa.scannerType = :scannerType
               AND sa.deletedAt IS NULL
-            ORDER BY sa.createdAt DESC
+            ORDER BY sa.createdAt DESC, sa.id DESC
             LIMIT 1
             """)
     Optional<SecurityAudit> findLatestActiveByVersionIdAndScannerType(

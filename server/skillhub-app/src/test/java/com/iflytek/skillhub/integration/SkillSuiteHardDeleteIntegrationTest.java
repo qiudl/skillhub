@@ -92,6 +92,8 @@ class SkillSuiteHardDeleteIntegrationTest {
     @Autowired private TransactionTemplate transactionTemplate;
     @Autowired private SkillSuiteLifecycleService service;
 
+    // Native suite slice deliberately excludes the auth layer.
+    @MockBean private com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization slarkAuthorization;
     @MockBean private SkillSuitePublicationValidator publicationValidator;
     @SpyBean private AuditLogService auditLogService;
 

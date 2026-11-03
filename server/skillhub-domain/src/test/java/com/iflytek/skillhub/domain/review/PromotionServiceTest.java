@@ -47,6 +47,7 @@ class PromotionServiceTest {
     @Mock private ApplicationEventPublisher eventPublisher;
     @Mock private GovernanceNotificationService governanceNotificationService;
     @Mock private EntityManager entityManager;
+    @Mock private PromotionMutationGuard mutationGuard;
 
     private PromotionService promotionService;
 
@@ -64,7 +65,7 @@ class PromotionServiceTest {
         promotionService = new PromotionService(
                 promotionRequestRepository, skillRepository, skillVersionRepository,
                 skillFileRepository, namespaceRepository, namespaceMemberRepository, permissionChecker,
-                eventPublisher, governanceNotificationService, entityManager, CLOCK);
+                eventPublisher, governanceNotificationService, entityManager, CLOCK, mutationGuard);
         lenient().when(namespaceRepository.findById(5L)).thenReturn(Optional.of(createSourceNamespace()));
     }
 
@@ -829,7 +830,7 @@ class PromotionServiceTest {
                     PROMOTION_ID, ReviewTaskStatus.APPROVED, REVIEWER_ID, "approved",
                     NEW_SKILL_ID, pending.getVersion());
             verify(skillRepository, times(1)).save(target);
-            verify(entityManager).lock(target, jakarta.persistence.LockModeType.PESSIMISTIC_WRITE);
+            verify(mutationGuard).approval(any(PromotionRequest.class));
         }
 
         @Test
@@ -861,7 +862,7 @@ class PromotionServiceTest {
                     () -> promotionService.approvePromotion(PROMOTION_ID, REVIEWER_ID, "approved",
                             Set.of("SKILL_ADMIN"), Set.of()));
             assertEquals("promotion.target_version_conflict", error.messageCode());
-            verify(entityManager).lock(target, jakarta.persistence.LockModeType.PESSIMISTIC_WRITE);
+            verify(mutationGuard).approval(any(PromotionRequest.class));
             verify(skillVersionRepository, never()).save(any(SkillVersion.class));
         }
     }

@@ -12,6 +12,8 @@ import com.iflytek.skillhub.domain.namespace.NamespaceRole;
 import com.iflytek.skillhub.domain.namespace.NamespaceRepository;
 import com.iflytek.skillhub.domain.namespace.NamespaceType;
 import com.iflytek.skillhub.domain.review.ReviewTask;
+import com.iflytek.skillhub.domain.user.UserAccount;
+import com.iflytek.skillhub.domain.user.UserAccountRepository;
 import com.iflytek.skillhub.domain.skill.Skill;
 import com.iflytek.skillhub.domain.skill.SkillRepository;
 import com.iflytek.skillhub.domain.skill.SkillVersion;
@@ -39,12 +41,18 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.verify;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -55,7 +63,27 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
 @Import(TestRedisConfig.class)
+@Testcontainers
 class SkillApprovalVisibilityFlowIntegrationTest {
+
+    // Review row locks and the existing Instant-valued JPQL use PostgreSQL semantics.
+    @Container
+    private static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @DynamicPropertySource
+    static void configurePostgres(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("spring.datasource.driver-class-name", () -> "org.postgresql.Driver");
+        registry.add("spring.jpa.database-platform", () -> "org.hibernate.dialect.PostgreSQLDialect");
+        registry.add("spring.flyway.enabled", () -> true);
+        registry.add("spring.jpa.hibernate.ddl-auto", () -> "validate");
+        registry.add("skillhub.builtin-skills.enabled", () -> false);
+    }
+
+    @Autowired
+    private UserAccountRepository users;
 
     @Autowired
     private MockMvc mockMvc;
@@ -92,6 +120,9 @@ class SkillApprovalVisibilityFlowIntegrationTest {
 
     @BeforeEach
     void setUp() {
+        for (String id : List.of("local-user", "super-1", "team-admin", "system")) {
+            if (users.findById(id).isEmpty()) users.save(new UserAccount(id, id, null, null));
+        }
         when(searchEmbeddingService.embed(anyString())).thenReturn("");
         when(searchEmbeddingService.similarity(anyString(), anyString())).thenReturn(0.0d);
         when(rbacService.getUserRoleCodes("super-1")).thenReturn(Set.of("SUPER_ADMIN"));
@@ -178,6 +209,7 @@ class SkillApprovalVisibilityFlowIntegrationTest {
                         .with(authentication(apiAuth("super-1", "SUPER_ADMIN")))
                         .with(csrf()))
                 .andExpect(status().isInternalServerError());
+        verify(auditLogRepository).save(any());
 
         ReviewTask savedReviewTask = reviewTaskJpaRepository.findAllById(List.of(graph.reviewTask().getId()))
                 .stream()

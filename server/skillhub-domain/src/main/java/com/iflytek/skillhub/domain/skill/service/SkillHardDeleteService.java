@@ -3,26 +3,41 @@ package com.iflytek.skillhub.domain.skill.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iflytek.skillhub.domain.audit.AuditLogService;
+import com.iflytek.skillhub.domain.namespace.NamespaceRepository;
+import com.iflytek.skillhub.domain.namespace.NamespaceStatus;
 import com.iflytek.skillhub.domain.report.SkillReportRepository;
 import com.iflytek.skillhub.domain.review.PromotionRequestRepository;
+import com.iflytek.skillhub.domain.review.ReviewSubjectType;
+import com.iflytek.skillhub.domain.review.ReviewTask;
 import com.iflytek.skillhub.domain.review.ReviewTaskRepository;
+import com.iflytek.skillhub.domain.review.ReviewTaskStatus;
 import com.iflytek.skillhub.domain.security.SecurityScanService;
 import com.iflytek.skillhub.domain.shared.exception.DomainBadRequestException;
+import com.iflytek.skillhub.domain.shared.exception.DomainForbiddenException;
+import com.iflytek.skillhub.domain.shared.exception.DomainNotFoundException;
 import com.iflytek.skillhub.domain.skill.Skill;
 import com.iflytek.skillhub.domain.skill.SkillFile;
 import com.iflytek.skillhub.domain.skill.SkillFileRepository;
 import com.iflytek.skillhub.domain.skill.SkillRepository;
+import com.iflytek.skillhub.domain.skill.SkillStatus;
 import com.iflytek.skillhub.domain.skill.SkillTagRepository;
 import com.iflytek.skillhub.domain.skill.SkillVersion;
 import com.iflytek.skillhub.domain.skill.SkillVersionRepository;
 import com.iflytek.skillhub.domain.skill.SkillVersionStatsRepository;
+import com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization;
 import com.iflytek.skillhub.domain.social.SkillRatingRepository;
 import com.iflytek.skillhub.domain.social.SkillStarRepository;
 import com.iflytek.skillhub.storage.ObjectStorageService;
-import java.util.LinkedHashMap;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityNotFoundException;
+import jakarta.persistence.LockModeType;
+import jakarta.persistence.PersistenceContext;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -54,6 +69,9 @@ public class SkillHardDeleteService {
     private final SecurityScanService securityScanService;
     private final AuditLogService auditLogService;
     private final ObjectMapper objectMapper;
+    private final NamespaceRepository namespaceRepository;
+    private final SlarkAssetAuthorization slarkAssetAuthorization;
+    @PersistenceContext private EntityManager entityManager;
 
     public SkillHardDeleteService(SkillRepository skillRepository,
                                   SkillVersionRepository skillVersionRepository,
@@ -69,7 +87,9 @@ public class SkillHardDeleteService {
                                   SkillStorageDeletionCompensationService compensationService,
                                   SecurityScanService securityScanService,
                                   AuditLogService auditLogService,
-                                  ObjectMapper objectMapper) {
+                                  ObjectMapper objectMapper,
+                                  NamespaceRepository namespaceRepository,
+                                  SlarkAssetAuthorization slarkAssetAuthorization) {
         this.skillRepository = skillRepository;
         this.skillVersionRepository = skillVersionRepository;
         this.skillFileRepository = skillFileRepository;
@@ -85,15 +105,94 @@ public class SkillHardDeleteService {
         this.securityScanService = securityScanService;
         this.auditLogService = auditLogService;
         this.objectMapper = objectMapper;
+        this.namespaceRepository = namespaceRepository;
+        this.slarkAssetAuthorization = slarkAssetAuthorization;
     }
 
     @Transactional
     public void hardDeleteSkill(Skill skill, String namespaceSlug, String actorUserId, String clientIp, String userAgent) {
+        prepareForDeletion(skill, namespaceSlug, actorUserId);
+        deleteSkill(skill, namespaceSlug, actorUserId, clientIp, userAgent, false);
+    }
+
+    /** Locks history → namespace → versions → asset, then checks current eligibility.
+     * Returns whether Slark maintenance replaces the portal's native owner/admin policy.
+     * Callers keep this transaction open through index and artifact deletion.
+     */
+    @Transactional
+    public boolean prepareForDeletion(Skill skill, String namespaceSlug, String actorUserId) {
+        assertNoPromotion(skill);
+        Long namespaceId = skill.getNamespaceId();
+        String slug = skill.getSlug();
+        List<ReviewTask> history = reviewTaskRepository.findBySkillIdOrderByIdAsc(skill.getId());
+        for (var task : history) refresh(task);
+        var namespace = namespaceRepository.findById(namespaceId)
+                .orElseThrow(() -> new DomainNotFoundException("error.namespace.notFound", namespaceId));
+        refresh(namespace);
+        List<SkillVersion> versions = skillVersionRepository.findBySkillId(skill.getId()).stream()
+                .sorted(Comparator.comparing(SkillVersion::getId)).toList();
+        for (var version : versions) refresh(version);
+        refresh(skill);
+        if (!Objects.equals(namespaceId, skill.getNamespaceId())
+                || !Objects.equals(slug, skill.getSlug())
+                || !Objects.equals(namespace.getSlug(), namespaceSlug.startsWith("@") ? namespaceSlug.substring(1) : namespaceSlug)) {
+            throw new DomainBadRequestException("review.candidate.mismatch");
+        }
+        var current = reviewTaskRepository.findBySkillIdOrderByIdAsc(skill.getId());
+        if (!history.stream().map(ReviewTask::getId).toList()
+                .equals(current.stream().map(ReviewTask::getId).toList())) {
+            throw new DomainBadRequestException("error.skill.publish.concurrentConflict", skill.getSlug());
+        }
+        for (var task : history) {
+            if (task.getSubjectType() != ReviewSubjectType.SKILL_VERSION
+                    || !Objects.equals(task.getNamespaceId(), namespaceId)
+                    || !Objects.equals(task.getSkillId(), skill.getId())
+                    || !Objects.equals(task.getSubjectId(), skill.getId())
+                    || !Objects.equals(task.getSkillVersionId(), task.getSubjectVersionId())
+                    || !Objects.equals(task.getSkillVersion(), task.getSubjectVersion())) {
+                throw new DomainBadRequestException("review.candidate.mismatch");
+            }
+            if (task.getSkillVersionId() != null) {
+                SkillVersion reviewed = versions.stream().filter(v -> Objects.equals(v.getId(), task.getSkillVersionId()))
+                        .findFirst().orElseThrow(() -> new DomainBadRequestException("review.candidate.mismatch"));
+                if (!Objects.equals(reviewed.getVersion(), task.getSkillVersion())) {
+                    throw new DomainBadRequestException("review.candidate.mismatch");
+                }
+            } else if (task.getStatus() == ReviewTaskStatus.PENDING) {
+                throw new DomainBadRequestException("review.candidate.mismatch");
+            }
+        }
+        if (namespace.getStatus() == NamespaceStatus.FROZEN) {
+            throw new DomainBadRequestException("error.namespace.frozen", namespace.getSlug());
+        }
+        if (namespace.getStatus() == NamespaceStatus.ARCHIVED) {
+            throw new DomainBadRequestException("error.namespace.archived", namespace.getSlug());
+        }
+        assertNoPromotion(skill);
+        var eligibility = slarkAssetAuthorization.can(SlarkAssetAuthorization.Operation.SUBMIT,
+                namespaceId, skill.getId(), actorUserId);
+        if (eligibility.isPresent()) {
+            if (!eligibility.get()) throw new DomainForbiddenException("error.skill.lifecycle.noPermission");
+            if (skill.getStatus() == SkillStatus.ARCHIVED) {
+                throw new DomainBadRequestException("error.skill.publish.archived", skill.getSlug());
+            }
+        }
+        return eligibility.isPresent();
+    }
+
+    private void assertNoPromotion(Skill skill) {
         if (skill.getSourceSkillId() != null
-                || promotionRequestRepository.findActiveInitialBySourceSkillId(skill.getId()).isPresent()) {
+                || promotionRequestRepository.findActiveInitialBySourceSkillId(skill.getId()).isPresent()
+                || promotionRequestRepository.findBySourceSkillIdAndStatus(skill.getId(), ReviewTaskStatus.PENDING).isPresent()) {
             throw new DomainBadRequestException("promotion.revocation.required");
         }
-        deleteSkill(skill, namespaceSlug, actorUserId, clientIp, userAgent, false);
+    }
+
+    private void refresh(Object entity) {
+        try {entityManager.refresh(entity, LockModeType.PESSIMISTIC_WRITE);}
+        catch (EntityNotFoundException missing) {
+            throw new DomainBadRequestException("error.skill.publish.concurrentConflict");
+        }
     }
 
     /** Deletes a revoked global derivative while retaining its promotion and revocation history. */

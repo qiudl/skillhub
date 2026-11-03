@@ -13,7 +13,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class ReviewPermissionCheckerTest {
 
-    private final ReviewPermissionChecker checker = new ReviewPermissionChecker();
+    private final ReviewPermissionChecker checker = new ReviewPermissionChecker(org.mockito.Mockito.mock(com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization.class));
 
     // --- canReview tests ---
 

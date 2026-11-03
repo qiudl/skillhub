@@ -39,11 +39,34 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+@org.testcontainers.junit.jupiter.Testcontainers
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
 @Import(TestRedisConfig.class)
+@org.springframework.test.annotation.DirtiesContext(classMode=org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 class SkillDeleteFlowIntegrationTest {
+    @org.testcontainers.junit.jupiter.Container
+    static final org.testcontainers.containers.PostgreSQLContainer<?> PG =
+            new org.testcontainers.containers.PostgreSQLContainer<>("postgres:16-alpine");
+    @org.springframework.test.context.DynamicPropertySource
+    static void database(org.springframework.test.context.DynamicPropertyRegistry r) {
+        r.add("spring.datasource.url", PG::getJdbcUrl);
+        r.add("spring.datasource.username", PG::getUsername);
+        r.add("spring.datasource.password", PG::getPassword);
+        r.add("spring.datasource.driver-class-name", () -> "org.postgresql.Driver");
+        r.add("spring.jpa.database-platform", () -> "org.hibernate.dialect.PostgreSQLDialect");
+        r.add("spring.flyway.enabled", () -> true);
+        r.add("spring.jpa.hibernate.ddl-auto", () -> "validate");
+    }
+    @Autowired private com.iflytek.skillhub.domain.user.UserAccountRepository users;
+    @org.junit.jupiter.api.BeforeEach
+    void actors() {
+        for (String id : List.of("system","owner-1","super-1","user-2")) {
+            if (users.findById(id).isEmpty()) users.save(new com.iflytek.skillhub.domain.user.UserAccount(id,id,null,null));
+        }
+    }
+
 
     @Autowired
     private MockMvc mockMvc;

@@ -47,13 +47,19 @@ class SkillReviewSubmitServiceTest {
 
     @BeforeEach
     void setUp() {
+        var namespaces = mock(com.iflytek.skillhub.domain.namespace.NamespaceRepository.class);
+        lenient().when(namespaces.findById(any())).thenAnswer(i -> {
+            var namespace = new com.iflytek.skillhub.domain.namespace.Namespace("team", "Team", "owner");
+            setField(namespace, "id", i.getArgument(0));
+            return Optional.of(namespace);
+        });
         service = new SkillReviewSubmitService(
                 skillRepository,
                 skillVersionRepository,
                 reviewTaskRepository,
-                null, // namespaceMemberRepository not used in these tests
+                namespaces,
                 eventPublisher,
-                Clock.systemUTC()
+                Clock.systemUTC(), mock(SlarkAssetAuthorization.class), mock(jakarta.persistence.EntityManager.class)
         );
     }
 

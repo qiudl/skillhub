@@ -5,6 +5,7 @@ import com.iflytek.skillhub.domain.namespace.Namespace;
 import com.iflytek.skillhub.domain.namespace.NamespaceRepository;
 import com.iflytek.skillhub.domain.namespace.NamespaceRole;
 import com.iflytek.skillhub.domain.namespace.NamespaceStatus;
+import com.iflytek.skillhub.domain.namespace.SlarkNamespaceBindingRepository;
 import com.iflytek.skillhub.domain.shared.exception.DomainBadRequestException;
 import com.iflytek.skillhub.domain.shared.exception.DomainForbiddenException;
 import com.iflytek.skillhub.domain.skill.*;
@@ -46,6 +47,7 @@ public class SkillDownloadService {
     private final VisibilityChecker visibilityChecker;
     private final ApplicationEventPublisher eventPublisher;
     private final SkillSlugResolutionService skillSlugResolutionService;
+    private final SlarkNamespaceBindingRepository slarkBindings;
 
     public SkillDownloadService(
             NamespaceRepository namespaceRepository,
@@ -57,7 +59,8 @@ public class SkillDownloadService {
             ObjectStorageService objectStorageService,
             VisibilityChecker visibilityChecker,
             ApplicationEventPublisher eventPublisher,
-            SkillSlugResolutionService skillSlugResolutionService) {
+            SkillSlugResolutionService skillSlugResolutionService,
+            SlarkNamespaceBindingRepository slarkBindings) {
         this.namespaceRepository = namespaceRepository;
         this.skillRepository = skillRepository;
         this.skillVersionRepository = skillVersionRepository;
@@ -68,6 +71,7 @@ public class SkillDownloadService {
         this.visibilityChecker = visibilityChecker;
         this.eventPublisher = eventPublisher;
         this.skillSlugResolutionService = skillSlugResolutionService;
+        this.slarkBindings = slarkBindings;
     }
 
     public record DownloadResult(
@@ -184,6 +188,12 @@ public class SkillDownloadService {
     }
 
     private DownloadResult buildDownloadResult(Skill skill, SkillVersion version) {
+        // REQ-20261013-0021 M1-09: includes review packages and every bundle fallback.
+        // PREPARED is not access authorization. Never mint a URL, read storage or count
+        // a download for a bound space, even with retained native owner/admin roles.
+        if (slarkBindings.isBound(skill.getNamespaceId())) {
+            throw new DomainForbiddenException("error.skill.access.denied", skill.getSlug());
+        }
 
         String storageKey = buildBundleStorageKey(skill, version);
 

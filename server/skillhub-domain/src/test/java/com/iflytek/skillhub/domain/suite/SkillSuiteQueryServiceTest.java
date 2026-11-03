@@ -45,7 +45,7 @@ class SkillSuiteQueryServiceTest {
     void setUp() {
         service = new SkillSuiteQueryService(
                 namespaceRepository, suiteRepository, versionRepository, memberRepository, stateResolver,
-                reviewTaskRepository, new ReviewPermissionChecker());
+                reviewTaskRepository, new ReviewPermissionChecker(org.mockito.Mockito.mock(com.iflytek.skillhub.domain.skill.SlarkAssetAuthorization.class)));
     }
 
     @Test

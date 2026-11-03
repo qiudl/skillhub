@@ -46,7 +46,7 @@ class PromotionRevocationServiceTest {
     void setUp() {
         service = new PromotionRevocationService(promotionRepository, revocationRepository,
                 historyRepository, skillRepository, namespaceRepository, hardDeleteService,
-                Clock.fixed(Instant.parse("2026-10-09T00:00:00Z"), ZoneOffset.UTC));
+                Clock.fixed(Instant.parse("2026-10-09T00:00:00Z"), ZoneOffset.UTC), org.mockito.Mockito.mock(PromotionMutationGuard.class));
         source = new Skill(2L, "foo", "owner-1", SkillVisibility.PUBLIC);
         target = new Skill(1L, "foo", "owner-1", SkillVisibility.PUBLIC);
         initial = new PromotionRequest(10L, 20L, 1L, "owner-1");
