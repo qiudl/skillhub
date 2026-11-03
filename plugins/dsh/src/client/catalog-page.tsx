@@ -12,7 +12,7 @@ import { UiAvailabilityNotice, type UiAvailability } from './ui-availability.js'
 import { NativeControlStyles } from './native-control-styles.js';
 import { catalogErrorMessage } from './catalog-error.js';
 import { QueryClient, QueryClientProvider, useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { TypertRemoteNamespaceMap } from '@deepseek-ai/dsh-typert-protocol';
 import { installedNavigationFor, type InstalledNavigation } from './installed-navigation.js';
 import { InstalledSkills } from './installed-skills.js';
@@ -35,10 +35,25 @@ export interface CatalogNavigation {
   tab: 'browse' | 'installed'; query: string; draft: string; sort?: Sort;
   labelSelection?: { sourceRevision: string; slug: string };
   selected: Item | null; sourceRevision: string | null; scrollTop: number;
+  /** Mounted catalog views subscribe here so an external "go home" is observable. */
+  homeListeners?: Set<() => void>;
 }
 export const createCatalogNavigation = (): CatalogNavigation => ({
   tab: 'browse', query: '', draft: '', selected: null, sourceRevision: null, scrollTop: 0,
 });
+/** Reset the panel to the skill-center home (广场首页) and notify mounted views. */
+export function resetCatalogNavigation(navigation: CatalogNavigation): void {
+  navigation.tab = 'browse';
+  navigation.selected = null;
+  navigation.query = '';
+  navigation.draft = '';
+  navigation.sort = undefined;
+  navigation.labelSelection = undefined;
+  navigation.installedOrigin = undefined;
+  navigation.installedNavigation = undefined;
+  navigation.scrollTop = 0;
+  navigation.homeListeners?.forEach(listener => listener());
+}
 function unwrap<T>(result: { ok: true; value: T } | { ok: false; error: { code: string; details?: unknown } }): T {
   if (result.ok) return result.value;
   throw new Error(catalogErrorMessage(result.error));
@@ -65,6 +80,20 @@ function Catalog({ remote, navigation, onReturn, installation, installed, availa
   const [labelSelection, setLabelSelection] = useState(navigation.labelSelection);
   const [selected, setSelected] = useState(navigation.selected);
   const scroller = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const goHome = () => {
+      setTab('browse');
+      setQuery('');
+      setDraft('');
+      setSort('newest');
+      setSelected(null);
+      setInstalledOrigin(undefined);
+      setLabelSelection(undefined);
+    };
+    navigation.homeListeners ??= new Set();
+    navigation.homeListeners.add(goHome);
+    return () => { navigation.homeListeners?.delete(goHome); };
+  }, [navigation]);
   const heading = useRef<HTMLHeadingElement>(null);
   const lastCard = useRef<HTMLButtonElement | null>(null);
   const lastSelected = useRef(selected);
@@ -169,7 +198,7 @@ function Catalog({ remote, navigation, onReturn, installation, installed, availa
         return { detail, sourceRevision: source.sourceRevision };
       }} />}
 
-    <header className="astron-sh-catalog-header"><div className="astron-sh-location"><Icon name="grid" /><strong>SkillHub</strong><span>/</span><span>{selected ? '技能详情' : '技能广场'}</span></div>
+    <header className="astron-sh-catalog-header"><div className="astron-sh-location"><Icon name="grid" /><strong>slark-skillhub</strong><span>/</span><span>{selected ? '技能详情' : '技能广场'}</span></div>
       <div className="astron-sh-toolbar-actions"><Button variant="ghost" className="astron-sh-icon-button" aria-label="查看当前来源" title={context.data?.registryUrl || '尚未配置来源'} onClick={() => setSourceOpen(value => !value)}><Icon name="info" /></Button>
       {(installation || installed) && <Button variant="ghost" className="astron-sh-icon-button" aria-label="返回会话" title="关闭 SkillHub，返回会话" onClick={() => { if (!selected && tab === 'browse') navigation.scrollTop = scroller.current?.scrollTop ?? 0; onReturn(); }}><Icon name="close" /></Button>}</div>
     </header>

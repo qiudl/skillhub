@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 
-export const supportedDshVersions = ['0.2.0-rc.2', '0.2.1-rc.2'] as const;
+export const supportedDshVersions = ['0.2.0-rc.2', '0.2.1-rc.2', '0.2.2-alpha.2'] as const;
 export type SupportedDshVersion = typeof supportedDshVersions[number];
 
 /** Retained Host dependency baseline; a match is necessary, not full product acceptance. */
@@ -23,6 +23,8 @@ export const cordisFamilies = [
     '@deepseek-ai/cordis-plugin-include': '1.0.9', '@deepseek-ai/cordis-plugin-timer': '1.1.6' },
   { '@deepseek-ai/cordis': '4.0.5', '@deepseek-ai/cordis-plugin-loader': '1.0.6',
     '@deepseek-ai/cordis-plugin-include': '1.0.10', '@deepseek-ai/cordis-plugin-timer': '1.1.7' },
+  { '@deepseek-ai/cordis': '4.0.6-alpha.1', '@deepseek-ai/cordis-plugin-loader': '1.0.7-alpha.1',
+    '@deepseek-ai/cordis-plugin-include': '1.0.11-alpha.1', '@deepseek-ai/cordis-plugin-timer': '1.1.8-alpha.1' },
 ] as const;
 
 const require = createRequire(import.meta.url);
@@ -43,6 +45,10 @@ export function assertHostDependencies(readManifest: (name: string) => unknown =
     else release = manifest.version;
   }
   if (release === '0.2.1-rc.2' && cordis !== '4.0.5') {
+    throw new Error('Host dependency baseline does not match; local writes are disabled.');
+  }
+  // Slark build (qiudl fork): accept 0.2.2-alpha.2 only with its own cordis family, never a mixed set.
+  if (release === '0.2.2-alpha.2' && cordis !== '4.0.6-alpha.1') {
     throw new Error('Host dependency baseline does not match; local writes are disabled.');
   }
   return release as SupportedDshVersion;
